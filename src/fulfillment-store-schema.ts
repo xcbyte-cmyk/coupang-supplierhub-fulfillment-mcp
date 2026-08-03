@@ -554,4 +554,3 @@ export function migrateFulfillmentDatabase(db: DatabaseSync): void {
     PRAGMA user_version = 10;
   `);
 }
-
