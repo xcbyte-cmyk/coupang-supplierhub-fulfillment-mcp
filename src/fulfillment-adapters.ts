@@ -1,21 +1,21 @@
 import { createHash } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { access, mkdir, stat, writeFile } from "node:fs/promises";
-import { createServer as createNetServer } from "node:net";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import AdmZip from "adm-zip";
 import {
-  chromium,
-  type Browser,
-  type BrowserContext,
   type Dialog,
   type Download,
   type Frame,
   type Locator,
   type Page,
 } from "playwright-core";
+import {
+  PersistentChromeSession,
+  sameOriginAndPath,
+} from "./persistent-chrome-session.js";
 import type {
   CenterMaster,
   DownloadedOrderFile,
@@ -720,12 +720,13 @@ export class SupplierHubFulfillmentBrowserAdapter
   async open(): Promise<FulfillmentConnectionResult> {
     try {
       const page = await this.session.open(this.privateLabelUrl);
-      await page.bringToFront();
+      await this.session.bringToFront(page);
       const loginSubmitted = this.semiAutomaticLogin
         ? await this.submitAutofilledLogin(page)
         : false;
       await this.navigateDashboardToPrivateLabel(page, loginSubmitted);
       const connection = await this.privateLabelConnection(page);
+      await this.session.bringToFront(page);
       if (loginSubmitted && connection.status === "login_required") {
         return {
           ...connection,
@@ -1423,38 +1424,51 @@ export class SupplierHubFulfillmentBrowserAdapter
     button: Locator,
     confirmSelector?: string,
   ): Promise<Download> {
+    type DownloadStartOutcome =
+      | { kind: "download"; download: Download }
+      | { kind: "confirmation" }
+      | { kind: "timeout" };
     const acceptNativeConfirmation = (dialog: Dialog) => {
       if (dialog.type() === "confirm") void dialog.accept();
       else void dialog.dismiss();
     };
     page.once("dialog", acceptNativeConfirmation);
-    const immediate = page
-      .waitForEvent("download", { timeout: 10_000 })
-      .catch(() => undefined);
-    let directDownload: Download | undefined;
+    const pendingDownload = page.waitForEvent("download", { timeout: 30_000 });
+    const racers: Array<Promise<DownloadStartOutcome>> = [
+      pendingDownload.then((download) => ({ kind: "download", download })),
+      page.waitForTimeout(10_000).then(() => ({ kind: "timeout" })),
+    ];
+    if (confirmSelector) {
+      racers.push(
+        page
+          .locator(confirmSelector)
+          .first()
+          .waitFor({ state: "visible", timeout: 10_000 })
+          .then(() => ({ kind: "confirmation" })),
+      );
+    }
+
+    let outcome: DownloadStartOutcome;
     try {
       await button.click();
-      directDownload = await immediate;
+      outcome = await Promise.race(racers);
     } finally {
       page.off("dialog", acceptNativeConfirmation);
     }
-    if (directDownload) return directDownload;
-    if (!confirmSelector) {
+    if (outcome.kind === "download") return outcome.download;
+    if (outcome.kind === "timeout" || !confirmSelector) {
       throw new FulfillmentAdapterBlockedError(
-        "다운로드가 시작되지 않았고 확인 버튼 셀렉터도 설정되지 않았습니다.",
+        confirmSelector
+          ? "발주서 버튼 클릭 후 다운로드 또는 확인창이 10초 안에 나타나지 않았습니다."
+          : "다운로드가 시작되지 않았고 확인 버튼 셀렉터도 설정되지 않았습니다.",
       );
     }
-    await page.locator(confirmSelector).first().waitFor({
-      state: "visible",
-      timeout: 5_000,
-    });
     const confirm = await requireUniqueVisible(
       page.locator(confirmSelector),
       "다운로드 확인 버튼",
     );
-    const pending = page.waitForEvent("download", { timeout: 30_000 });
     await confirm.click();
-    return await pending;
+    return await pendingDownload;
   }
 
   private async trackingSaveConfirmed(
@@ -1536,7 +1550,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
       const page = await this.session.open(
         requiredConfig(this.config.registrationUrl, "로젠 주문등록 URL"),
       );
-      await page.bringToFront();
+      await this.session.bringToFront(page);
       const loginResult = await this.clickLoginWhenCredentialsAreReady(page);
       if (loginResult) return loginResult;
 
@@ -1552,7 +1566,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
         .waitFor({ state: "visible", timeout: LOGEN_MAIN_READY_TIMEOUT_MS })
         .catch(() => undefined);
       await page.waitForTimeout(1_000);
-      await page.bringToFront();
+      await this.session.bringToFront(page);
       const connection = await this.connectionStatus(page);
       if (connection.status !== "ready") return connection;
       return {
@@ -3339,178 +3353,6 @@ export class FulfillmentAdapterBlockedError extends Error {
     super(message);
     this.name = "FulfillmentAdapterBlockedError";
   }
-}
-
-class PersistentChromeSession {
-  private context?: BrowserContext;
-  private page?: Page;
-  private cdpBrowser?: Browser;
-  private cdpProcess?: ChildProcess;
-
-  constructor(
-    private readonly profileDir: string,
-    private readonly headless: boolean,
-    private readonly connectionMode: "playwright" | "cdp" = "playwright",
-    private readonly chromeExecutablePath?: string,
-  ) {}
-
-  async open(url: string): Promise<Page> {
-    const page = await this.getPage();
-    if (!sameOriginAndPath(page.url(), url)) {
-      await page.goto(url, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(500);
-    }
-    return page;
-  }
-
-  async close(): Promise<void> {
-    if (this.cdpBrowser) {
-      await this.cdpBrowser.close().catch(() => undefined);
-    } else {
-      await this.context?.close();
-    }
-    if (this.cdpProcess && this.cdpProcess.exitCode === null) {
-      this.cdpProcess.kill();
-    }
-    this.context = undefined;
-    this.page = undefined;
-    this.cdpBrowser = undefined;
-    this.cdpProcess = undefined;
-  }
-
-  private async getPage(): Promise<Page> {
-    if (!this.context) {
-      await mkdir(this.profileDir, { recursive: true });
-      if (this.connectionMode === "cdp") {
-        await this.connectToNormallyLaunchedChrome();
-      } else {
-        this.context = await chromium.launchPersistentContext(this.profileDir, {
-          channel: "chrome",
-          headless: this.headless,
-          acceptDownloads: true,
-          viewport: { width: 1440, height: 960 },
-        });
-      }
-      const context = this.context;
-      if (!context) throw new Error("Chrome 브라우저 컨텍스트를 만들지 못했습니다.");
-      context.on("close", () => {
-        this.context = undefined;
-        this.page = undefined;
-      });
-    }
-    const context = this.context;
-    if (!context) throw new Error("Chrome 브라우저 컨텍스트가 종료되었습니다.");
-    if (!this.page || this.page.isClosed()) {
-      this.page = context.pages()[0] ?? (await context.newPage());
-    }
-    return this.page;
-  }
-
-  private async connectToNormallyLaunchedChrome(): Promise<void> {
-    const executable = resolveChromeExecutable(this.chromeExecutablePath);
-    const port = await reserveLoopbackPort();
-    const args = [
-      `--remote-debugging-port=${port}`,
-      "--remote-debugging-address=127.0.0.1",
-      `--user-data-dir=${this.profileDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-background-mode",
-      "--disable-session-crashed-bubble",
-      "--hide-crash-restore-bubble",
-    ];
-    if (this.headless) args.push("--headless=new");
-    this.cdpProcess = spawn(executable, args, {
-      detached: false,
-      stdio: "ignore",
-      windowsHide: this.headless,
-    });
-
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (this.cdpProcess.exitCode !== null) {
-        throw new Error(
-          `일반 Chrome이 원격 디버깅 연결 전에 종료되었습니다. 종료 코드: ${this.cdpProcess.exitCode}`,
-        );
-      }
-      try {
-        this.cdpBrowser = await chromium.connectOverCDP(
-          `http://127.0.0.1:${port}`,
-        );
-        this.context = this.cdpBrowser.contexts()[0];
-        if (!this.context) throw new Error("Chrome 기본 컨텍스트를 찾을 수 없습니다.");
-        this.cdpBrowser.on("disconnected", () => {
-          this.context = undefined;
-          this.page = undefined;
-          this.cdpBrowser = undefined;
-          this.cdpProcess = undefined;
-        });
-        return;
-      } catch (error) {
-        lastError = error;
-        await delay(250);
-      }
-    }
-    this.cdpProcess.kill();
-    throw new Error(
-      `일반 Chrome CDP 연결을 시작하지 못했습니다: ${errorMessage(lastError)}`,
-    );
-  }
-}
-
-function sameOriginAndPath(currentUrl: string, targetUrl: string): boolean {
-  try {
-    const current = new URL(currentUrl);
-    const target = new URL(targetUrl);
-    return current.origin === target.origin && current.pathname === target.pathname;
-  } catch {
-    return false;
-  }
-}
-
-async function reserveLoopbackPort(): Promise<number> {
-  return await new Promise<number>((resolvePort, reject) => {
-    const server = createNetServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close();
-        reject(new Error("Chrome CDP용 로컬 포트를 확보하지 못했습니다."));
-        return;
-      }
-      const port = address.port;
-      server.close((error) => (error ? reject(error) : resolvePort(port)));
-    });
-  });
-}
-
-function resolveChromeExecutable(configured?: string): string {
-  const candidates = [
-    configured,
-    process.env.PROGRAMFILES
-      ? join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe")
-      : undefined,
-    process.env["PROGRAMFILES(X86)"]
-      ? join(
-          process.env["PROGRAMFILES(X86)"],
-          "Google",
-          "Chrome",
-          "Application",
-          "chrome.exe",
-        )
-      : undefined,
-    process.env.LOCALAPPDATA
-      ? join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe")
-      : undefined,
-  ].filter((value): value is string => Boolean(value?.trim()));
-  const executable = candidates.find((candidate) => existsSync(candidate));
-  if (!executable) {
-    throw new Error(
-      "Google Chrome 실행 파일을 찾지 못했습니다. SUPPLIERHUB_CHROME_EXECUTABLE을 설정하세요.",
-    );
-  }
-  return executable;
 }
 
 async function delay(milliseconds: number): Promise<void> {

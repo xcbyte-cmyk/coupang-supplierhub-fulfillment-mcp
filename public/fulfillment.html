@@ -959,7 +959,7 @@
             card?.classList.remove("running", "failed");
             card?.classList.add("completed");
             if (stageStatus) stageStatus.textContent = status === "partial" ? "부분 완료 · 다음 단계 진행" : "완료";
-            const browserOrDeviceStage = [1, 2, 5, 7, 8, 9, 11, 12, 13, 14].includes(number);
+            const browserOrDeviceStage = [1, 2, 5, 8, 9, 11, 12, 13, 14].includes(number);
             if (number < 14 && browserOrDeviceStage) {
               summary.textContent = `${number}단계 완료 · 다음 단계 전 1초 대기 중…`;
               await new Promise(resolve => setTimeout(resolve, 1000));

@@ -196,7 +196,7 @@ describe("integrated fulfillment v2 execution", () => {
     expect(harness.printer.calls.filter((call) => call.kind === "shipment")).toHaveLength(0);
 
     const stage10 = await harness.workflow.registerSupplierHubShipmentTracking({ runId });
-    expect(stage10.status).toBe("completed");
+    expect(stage10.status, stage10.message).toBe("completed");
     const stage11 = await harness.workflow.printSupplierHubShipmentDocuments({ runId });
     expect(stage11.status).toBe("completed");
   });
@@ -332,12 +332,12 @@ class RecordingLogen implements LogenPort, LogenBatchPort {
     printerName: string,
   ): Promise<LogenBatchWaybillResult[]> {
     this.waybillCalls.push({ batches: structuredClone(batches), printerName });
-    return batches.map((batch) => ({
+    return batches.map((batch, batchIndex) => ({
       batchId: batch.id,
       fixTakeNo: batch.fixTakeNo,
       slipNos: Array.from(
         { length: batch.cartonCount },
-        (_, index) => `SLIP-${batch.orderNo}-${batch.skuCode}-${index + 1}`,
+        (_, index) => String(44_800_000_000 + batchIndex * 100 + index + 1),
       ),
       success: true,
       status: "submitted",
@@ -363,10 +363,10 @@ class RecordingLogen implements LogenPort, LogenBatchPort {
     jobs: ShippingJob[],
     _printerName: string,
   ): Promise<LogenWaybillResult[]> {
-    return jobs.map((job) => ({
+    return jobs.map((job, index) => ({
       shippingJobId: job.id,
       fixTakeNo: job.fixTakeNo,
-      slipNo: `SLIP-${job.orderNo}-${job.skuCode}-${job.cartonIndex}`,
+      slipNo: String(44_900_000_000 + index + 1),
       success: true,
       status: "submitted",
       message: "printed",
@@ -454,7 +454,7 @@ function makeHarness(): Harness {
 
 function seedRouting(store: FulfillmentStore): void {
   store.setSenderProfile({
-    name: "대령화학",
+    name: "테스트 공급사",
     address: "경기도 광주시 테스트로 1",
     telephone: "031-000-0000",
     customerCode: "99999999",
@@ -483,8 +483,13 @@ async function prepareThroughWaybills(harness: Harness): Promise<string> {
   await harness.workflow.downloadOrderFiles({ runId });
   await harness.workflow.printOrderFiles({ runId });
   await harness.workflow.recordPrintResult({ runId });
-  await harness.workflow.registerLogenDeliveryOrder({ runId, dataSource: "order_file" });
-  await harness.workflow.printLogenWaybill({ runId });
+  const registered = await harness.workflow.registerLogenDeliveryOrder({
+    runId,
+    dataSource: "order_file",
+  });
+  expect(registered.status, registered.message).toBe("completed");
+  const waybills = await harness.workflow.printLogenWaybill({ runId });
+  expect(waybills.status, waybills.message).toBe("completed");
   return runId;
 }
 

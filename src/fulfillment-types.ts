@@ -543,6 +543,23 @@ export interface ParcelUploadSubmission {
   message: string;
 }
 
+export interface SupplierHubShipmentUploadInput {
+  fileName: string;
+  filePath: string;
+  expectedInboundDate: string;
+  shipDate: string;
+  shipTime: string;
+  /** false이면 파일 첨부와 요약까지만 확인하고 외부 업로드는 제출하지 않는다. */
+  submit?: boolean;
+  shipLocationLabel?: string;
+  expectedGroupCount: number;
+  shipmentGroups: Array<{
+    orderNo: string;
+    centerCode: string;
+    expectedInboundDate: string;
+  }>;
+}
+
 export interface SupplierHubShipmentSummary {
   shipmentId: string;
   orderNo: string;
@@ -551,22 +568,9 @@ export interface SupplierHubShipmentSummary {
 }
 
 export interface SupplierHubShipmentPort {
-  uploadTrackingWorkbook(input: {
-    fileName: string;
-    filePath: string;
-    expectedInboundDate: string;
-    shipDate: string;
-    shipTime: string;
-    /** false이면 파일 첨부와 요약까지만 확인하고 외부 업로드는 제출하지 않는다. */
-    submit?: boolean;
-    shipLocationLabel?: string;
-    expectedGroupCount: number;
-    shipmentGroups: Array<{
-      orderNo: string;
-      centerCode: string;
-      expectedInboundDate: string;
-    }>;
-  }): Promise<ParcelUploadSubmission>;
+  uploadTrackingWorkbook(
+    input: SupplierHubShipmentUploadInput,
+  ): Promise<ParcelUploadSubmission>;
   listShipmentSummaries(
     expectedInboundDate: string,
     orderNos?: string[],

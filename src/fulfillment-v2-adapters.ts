@@ -4,6 +4,7 @@ import type {
   ShipmentDocumentResult,
   SupplierHubShipmentPort,
   SupplierHubShipmentSummary,
+  SupplierHubShipmentUploadInput,
 } from "./fulfillment-types.js";
 import type {
   BulkShipmentUploadResult,
@@ -17,21 +18,9 @@ type ShipmentDocuments = ShipmentDocumentResult["documents"];
 export class LiveSupplierHubShipmentAdapter implements SupplierHubShipmentPort {
   constructor(private readonly delegate: ShipmentFulfillmentPort) {}
 
-  async uploadTrackingWorkbook(input: {
-    fileName: string;
-    filePath: string;
-    expectedInboundDate: string;
-    shipDate: string;
-    shipTime: string;
-    submit?: boolean;
-    shipLocationLabel?: string;
-    expectedGroupCount: number;
-    shipmentGroups: Array<{
-      orderNo: string;
-      centerCode: string;
-      expectedInboundDate: string;
-    }>;
-  }): Promise<ParcelUploadSubmission> {
+  async uploadTrackingWorkbook(
+    input: SupplierHubShipmentUploadInput,
+  ): Promise<ParcelUploadSubmission> {
     const result = await this.delegate.uploadWorkbook({
       workbookPath: input.filePath,
       expectedInboundDate: input.expectedInboundDate,
@@ -103,21 +92,7 @@ interface DemoShipmentRecord extends SupplierHubShipmentSummary {
 }
 
 export interface DemoUploadRecord {
-  input: {
-    fileName: string;
-    filePath: string;
-    expectedInboundDate: string;
-    shipDate: string;
-    shipTime: string;
-    submit?: boolean;
-    shipLocationLabel?: string;
-    expectedGroupCount: number;
-    shipmentGroups: Array<{
-      orderNo: string;
-      centerCode: string;
-      expectedInboundDate: string;
-    }>;
-  };
+  input: SupplierHubShipmentUploadInput;
   submission: ParcelUploadSubmission;
 }
 
@@ -126,21 +101,9 @@ export class DemoSupplierHubShipmentAdapter implements SupplierHubShipmentPort {
   private readonly shipments = new Map<string, DemoShipmentRecord>();
   private readonly uploads: DemoUploadRecord[] = [];
 
-  async uploadTrackingWorkbook(input: {
-    fileName: string;
-    filePath: string;
-    expectedInboundDate: string;
-    shipDate: string;
-    shipTime: string;
-    submit?: boolean;
-    shipLocationLabel?: string;
-    expectedGroupCount: number;
-    shipmentGroups: Array<{
-      orderNo: string;
-      centerCode: string;
-      expectedInboundDate: string;
-    }>;
-  }): Promise<ParcelUploadSubmission> {
+  async uploadTrackingWorkbook(
+    input: SupplierHubShipmentUploadInput,
+  ): Promise<ParcelUploadSubmission> {
     const groups = uniqueShipmentGroups(input.shipmentGroups);
     if (input.submit === false) {
       const submission: ParcelUploadSubmission = {
@@ -265,21 +228,9 @@ export class BlockedSupplierHubShipmentAdapter implements SupplierHubShipmentPor
       "Supplier Hub 쉽먼트 실연동 설정이 완료되지 않아 작업을 차단했습니다.",
   ) {}
 
-  async uploadTrackingWorkbook(_input: {
-    fileName: string;
-    filePath: string;
-    expectedInboundDate: string;
-    shipDate: string;
-    shipTime: string;
-    submit?: boolean;
-    shipLocationLabel?: string;
-    expectedGroupCount: number;
-    shipmentGroups: Array<{
-      orderNo: string;
-      centerCode: string;
-      expectedInboundDate: string;
-    }>;
-  }): Promise<ParcelUploadSubmission> {
+  async uploadTrackingWorkbook(
+    _input: SupplierHubShipmentUploadInput,
+  ): Promise<ParcelUploadSubmission> {
     return {
       status: "failed",
       message: `[blocked] ${this.blockedReason}`,
@@ -322,21 +273,9 @@ export class ModeRoutedSupplierHubShipmentAdapter
       new BlockedSupplierHubShipmentAdapter(),
   ) {}
 
-  async uploadTrackingWorkbook(input: {
-    fileName: string;
-    filePath: string;
-    expectedInboundDate: string;
-    shipDate: string;
-    shipTime: string;
-    submit?: boolean;
-    shipLocationLabel?: string;
-    expectedGroupCount: number;
-    shipmentGroups: Array<{
-      orderNo: string;
-      centerCode: string;
-      expectedInboundDate: string;
-    }>;
-  }): Promise<ParcelUploadSubmission> {
+  async uploadTrackingWorkbook(
+    input: SupplierHubShipmentUploadInput,
+  ): Promise<ParcelUploadSubmission> {
     return (await this.target()).uploadTrackingWorkbook(input);
   }
 

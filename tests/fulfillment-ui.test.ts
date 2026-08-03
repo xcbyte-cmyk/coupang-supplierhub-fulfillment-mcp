@@ -40,7 +40,7 @@ describe("fulfillment operating UI", () => {
     expect(html).toContain('id="dateTo"');
     expect(html).toContain("orderQueryInput()");
     expect(html).toContain("시작일만 고르면 종료일도 같은 날짜로 자동 설정됩니다");
-    expect(html).toContain("▸ 고급 복구 옵션");
+    expect(html).toContain("고급 복구 옵션 · 이전 Scan ID / Run ID로 다시 연결");
     expect(html).toContain('id="stageRecordStage"');
     expect(html).toContain('id="resetStageRecord"');
     expect(html).toContain('postContextTool("reset_fulfillment_stage_record"');
@@ -49,5 +49,14 @@ describe("fulfillment operating UI", () => {
     expect(html).toContain('data-stage-reset="${number}"');
     expect(html).toContain("등록키+이력 초기화");
     expect(html).toContain("clearLogenRegistration");
+  });
+
+  it("does not add a fixed transition delay after stage 7", () => {
+    const match = html.match(
+      /const browserOrDeviceStage = \[([^\]]+)\]\.includes\(number\)/,
+    );
+    expect(match).not.toBeNull();
+    const delayedStages = match![1].split(",").map((value) => Number(value.trim()));
+    expect(delayedStages).not.toContain(7);
   });
 });

@@ -186,7 +186,7 @@ function batch(): LogenBatch {
 
 function sender(): SenderProfile {
   return {
-    name: "대령화학",
+    name: "테스트 공급사",
     address: "경기도 광주시 송하인로 1",
     telephone: "031-000-0000",
     customerCode: "99999999",

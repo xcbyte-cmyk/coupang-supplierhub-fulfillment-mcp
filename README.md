@@ -1,20 +1,10 @@
 # Supplier Hub Private Label Workflow MCP
 
-쿠팡 Supplier Hub의 `Private Label 발주 리스트`를 조회하고, 신규 발주를 중복 없이 관리한 뒤 승인된 발주서 XLSX만 인쇄하는 로컬 MCP Apps 대시보드입니다.
-
-## MCP 아이디어 워크플로 프로토타입
-
-실제 자동화와 분리해, Private Label 발주 조회·확정·출력 10단계와 로젠택배·쉽먼트 처리 4단계로 구성한 총 14개 MCP 역할을 살펴보는 정적 HTML을 함께 제공합니다.
-
-```text
-http://127.0.0.1:4310/concept
-```
-
-`workflow-concept.html`에는 버튼, 체크 항목, 상태 저장, API 호출이 없습니다. 기존 운영 대시보드는 `http://127.0.0.1:4310/`에서 그대로 사용할 수 있습니다.
+쿠팡 Supplier Hub의 `Private Label 발주 리스트` 조회부터 발주확정, 택배 주문·송장, 쉽먼트 문서 출력까지 관리하는 로컬 MCP Apps 대시보드입니다. 운영 화면은 `http://127.0.0.1:4310/fulfillment`에서 사용합니다. 현재 포함된 택배사 구현과 실연동 교정값은 **로젠택배 기준 예시**이며, 모든 사용자가 로젠택배나 같은 프린터를 쓴다고 가정하지 않습니다.
 
 ## 16단계 Fulfillment MCP
 
-정적 콘셉트와 분리해, 같은 `/mcp` 서버에 다음 16개 단계 도구, 4단계 호환 별칭과 운영 도구를 구현했습니다.
+같은 `/mcp` 서버에 다음 16개 단계 도구, 4단계 호환 별칭과 운영 도구를 구현했습니다.
 
 ```text
 open_supplierhub → list_private_label_orders → compare_new_orders
@@ -37,7 +27,7 @@ open_supplierhub → list_private_label_orders → compare_new_orders
 - 15단계 준비 테스트: 송장입력 XLSX 생성 → Supplier Hub 첨부·요약 확인 → 업로드 직전 중단
 - 15단계 실제 등록: 준비된 XLSX 일괄등록 → 작업 결과 확인 → 쉽먼트 번호 연결
 - 동일 실행을 다시 호출해도 로젠 등록·쿠팡 업로드·인쇄를 자동으로 반복하지 않음
-- 발주서·쉽먼트 문서는 `SINDOH N600 Series PCL-8`, 로젠 송장은 설치된 `AllLive OLIVE-308B` 공유 프린터로 분리
+- 발주서·쉽먼트·송장 프린터는 사용자 PC의 `.env`에서 각각 지정하며 서로 같거나 달라도 됨
 - 담당 Agent: Supplier Hub 단계는 `Supplier Hub Agent`, 로젠 11~14단계는 `Logen Agent`, 로컬 판정·엑셀 작성·출력 기록은 `Fulfillment Coordinator`
 - 로젠 연동방법: 실행별로 `api` 또는 `website_mcp`를 선택하며, 11단계에서 선택한 방식이 해당 `runId`에 고정됨
 
@@ -46,6 +36,27 @@ open_supplierhub → list_private_label_orders → compare_new_orders
 ## 실연동 설정
 
 `.env.example`을 참고해 로컬 `.env`를 구성합니다. 비밀번호와 API Secret Key는 SQLite에 저장되지 않으며 저장소에 커밋하지 않습니다.
+
+### 사용자별 택배사와 프린터
+
+택배사와 프린터는 사용자·사업장·계약 조건·PC마다 달라지는 로컬 설정입니다. 저장소의 로젠 URL, 셀렉터, API 항목과 SINDOH/AllLive 이름은 현재 개발 환경의 기준 구현 또는 예시값일 뿐 공통 기본값이 아닙니다.
+
+- **택배사:** 현재 11~14단계에는 로젠 웹사이트 MCP와 로젠 Open API 어댑터가 구현되어 있습니다. 다른 택배사를 사용할 때는 해당 택배사의 로그인, 주문등록, 송장출력, 송장번호 조회 어댑터를 추가하고 11~14단계에 연결해야 합니다. 택배사 이름만 바꿔서는 연동되지 않습니다.
+- **프린터:** 각 사용자 PC의 Windows 설정 또는 인쇄 대화상자에 표시되는 정확한 프린터 이름을 아래 환경변수에 입력합니다. 다른 사용자의 프린터 이름이나 공유 경로를 그대로 복사하지 않습니다.
+
+```env
+FULFILLMENT_ORDER_PRINTER=발주서 인쇄용 Windows 프린터 이름
+FULFILLMENT_SHIPMENT_PRINTER=쉽먼트 문서 인쇄용 Windows 프린터 이름
+FULFILLMENT_WAYBILL_PRINTER=택배 송장 인쇄용 Windows 프린터 이름 또는 공유 경로
+```
+
+발주서와 쉽먼트 문서는 같은 프린터를 지정해도 되고 별도 프린터를 지정해도 됩니다. 실연동 전에는 각 PC에서 설치 여부, 온라인 상태, 기본 용지와 라벨 규격, 공유 프린터 접근 권한을 단계별로 교정합니다. 실제 비밀번호, API 키, 사용자별 프린터·공유 경로가 담긴 `.env`는 커밋하지 않습니다.
+
+4311 Windows 인쇄 MCP를 직접 시작할 때도 해당 PC의 송장 프린터를 넘겨야 합니다.
+
+```powershell
+npm run start:logen-windows-mcp -- -PrinterName "Windows에 표시되는 송장 프린터 이름"
+```
 
 실연동 전에 다음 값이 필요합니다.
 
@@ -58,7 +69,7 @@ open_supplierhub → list_private_label_orders → compare_new_orders
 
 `FULFILLMENT_MASTER_DATA_FILE`에는 `products`, `centers`, `sender`를 가진 JSON 파일을 지정할 수 있습니다. `FULFILLMENT_SHIPMENT_WORKBOOK`을 지정하면 송장입력 준비본의 SKU·입수수량을 SQLite 상품 기준정보로 가져옵니다. `FULFILLMENT_SHIPMENT_UPLOAD_TEMPLATE`은 15단계에서 스타일을 보존한 채 카톤 행과 송장번호를 채우는 원본입니다.
 
-로젠은 두 채널을 제공합니다.
+현재 기준 택배사인 로젠은 두 채널을 제공합니다.
 
 - `website_mcp`: 로젠 기업전용시스템을 전용 Chrome 프로필로 조작합니다. 라이브 셀렉터가 비어 있으면 등록·인쇄 버튼을 누르지 않고 교정 필요 상태로 중단합니다.
 - `api`: 공식 `registerOrderData`로 주문을 등록하고 `inquirySlipNoMulti`로 출력 송장번호를 조회합니다. `LOGEN_API_ENVIRONMENT=test|live`, `LOGEN_API_USER_ID`, `LOGEN_CUSTOMER_CODE`, `LOGEN_API_SECRET_KEY`가 필요합니다. 공식 송장 출력 API는 파일이 아니라 외부 출력 팝업을 제공하므로, 현재는 팝업 MCP 교정 전까지 14단계를 명시적으로 차단합니다.
@@ -89,7 +100,7 @@ open_supplierhub → list_private_label_orders → compare_new_orders
 
 ## 가장 간단한 실행
 
-[`start-dashboard.cmd`](./start-dashboard.cmd)를 실행하면 빌드 후 서버를 숨김 창으로 시작하고 `http://127.0.0.1:4310/`을 엽니다.
+[`start-dashboard.cmd`](./start-dashboard.cmd)를 실행하면 빌드 후 서버를 숨김 창으로 시작하고 `http://127.0.0.1:4310/fulfillment`를 엽니다.
 
 기본 설정은 안전한 **데모 모드**입니다. `지금 신규 발주 조회`를 누르면 기준선 2건과 신규 1건으로 전체 승인·인쇄 흐름을 실제 출력 없이 확인할 수 있습니다.
 
@@ -128,18 +139,18 @@ codex mcp add supplierhub-workflow --url http://127.0.0.1:4310/mcp
 5. 다음 조회부터 새로 발견된 발주만 선택·승인할 수 있습니다.
 6. 실제 인쇄 전 `PRINT batch-...` 확인 문구를 정확히 입력해야 합니다.
 
-실제 인쇄는 설정된 프린터가 Windows 기본 프린터와 같고 오프라인이 아닐 때만 실행됩니다. 기본값은 현재 PC에서 확인된 `SINDOH N600 Series PCL-8`, 1부입니다.
+실제 인쇄 전에는 각 사용자 PC의 `.env`에 지정된 프린터가 Windows에 설치되어 있고 오프라인이 아닌지 확인해야 합니다. 저장소의 예시 프린터 이름을 운영 기본값으로 간주하지 마세요.
 
 ## 검증 상태
 
 - TypeScript 빌드: 통과
-- 업무 모듈 테스트: 11개 파일, 72개 테스트 통과
+- 업무 모듈 테스트: 18개 파일, 116개 테스트 통과
 - v2 통합 사례: 발주 6건 → 로젠 PO+SKU 배치 6건 → 카톤·송장 14건 → 발주별 쉽먼트 6건
 - 같은 실행 재호출 시 로젠 등록·송장 출력·쿠팡 업로드·쉽먼트 문서 출력 중복 방지 확인
 - 발주별 부분 처리·후속 재개, 확정 업로드의 발주별 귀속 보존, 실연동 전체 실행 게이트, 동시 단계 호출 직렬화, 진행된 카톤 스냅샷 보존 확인
 - 4단계 이후 중단된 실행의 자동 재개와 로젠 등록·업로드·인쇄 요청 중단 시 `unknown` 보존 및 자동 반복 차단 확인
-- 실제 Supplier Hub 30일 목록 26건과 상태 분류, 발주 `138250790`의 확정 양식 다운로드·준비 엑셀 작성까지 교정 완료. 7단계 업로드와 이후 물리 출력은 미실행
-- 로젠 공식 API: 요청 계약과 선택 라우팅은 구현·시험 완료, TEST Key 미발급 및 외부 송장 출력 팝업 미교정으로 실호출·실출력은 미실행
+- Supplier Hub·로젠 실연동은 계정별 화면 셀렉터, 프린터, API 승인 상태에 따라 별도 교정 필요
+- 외부 저장·업로드·물리 인쇄는 `calibration` 모드에서 단계별로 확인한 뒤 활성화
 
 Supplier Hub 화면 구조가 바뀌어 필수 입력란·버튼·테이블을 찾지 못하면 인쇄를 계속하지 않고 오류로 중단합니다.
 

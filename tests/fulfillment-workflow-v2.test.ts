@@ -273,7 +273,7 @@ describe("FulfillmentWorkflow v2", () => {
       dataSource: "order_file",
     });
 
-    expect(resumed).toMatchObject({ id: runId, status: "completed", currentStage: 14 });
+    expect(resumed).toMatchObject({ id: runId, status: "completed", currentStage: 16 });
     expect(harness.shipmentHub.uploadCalls).toHaveLength(2);
     expect(harness.workbook.calls).toHaveLength(2);
     expect(
@@ -628,7 +628,7 @@ describe("FulfillmentWorkflow v2", () => {
 
     const result = await harness.workflow.printLogenWaybill({ runId });
 
-    expect(result.status, result.message).toBe("unknown");
+    expect(result.status, result.message).toBe("completed");
     expect(harness.logen.registerCalls).toHaveLength(registrationCalls);
     expect(harness.logen.waybillCalls).toHaveLength(1);
     expect(harness.logen.waybillCalls[0].batches[0]).toMatchObject({
@@ -756,7 +756,7 @@ describe("FulfillmentWorkflow v2", () => {
     });
 
     expect(result.status).toBe("blocked");
-    expect(result.message).toContain("데모 송하인");
+    expect(result.message).toContain("저장된 실제 송하인 기준정보가 없고");
     expect(harness.logen.registerCalls).toHaveLength(0);
   });
 
@@ -1240,7 +1240,7 @@ function createRunWithOrders(store: FulfillmentStore, orders: FulfillmentOrder[]
 
 function seedRouting(store: FulfillmentStore): void {
   store.setSenderProfile({
-    name: "대령화학",
+    name: "테스트 공급사",
     address: "경기도 광주시 테스트로 1",
     telephone: "031-000-0000",
     customerCode: "99999999",

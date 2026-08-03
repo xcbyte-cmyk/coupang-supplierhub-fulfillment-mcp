@@ -219,7 +219,7 @@ describe("FulfillmentStore run ownership", () => {
     const { store, runId } = createStoreWithRun();
     store.saveStageResult({
       runId,
-      stage: 14,
+      stage: 16,
       status: "completed",
       message: "완료",
       updatedAt: later(),
@@ -233,7 +233,7 @@ describe("FulfillmentStore run ownership", () => {
     });
 
     expect(store.getRun(runId)).toMatchObject({
-      currentStage: 14,
+      currentStage: 16,
       status: "completed",
     });
   });
