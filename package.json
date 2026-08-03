@@ -1,0 +1,32 @@
+{
+  "name": "coupang-supplierhub-workflow-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP Apps dashboard for managing Coupang Supplier Hub Private Label purchase-order printing.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "start:logen-windows-mcp": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/start-logen-windows-mcp.ps1",
+    "start": "node dist/server.js",
+    "test": "vitest run tests",
+    "check": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "1.7.5",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "adm-zip": "0.6.0",
+    "playwright-core": "1.62.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "0.5.7",
+    "@types/node": "24.3.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

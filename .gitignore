@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+data/
+work/
+.playwright-cli/
+design-qa-evidence/
+*.log
+*.pid
+__pycache__/
+*.pyc
