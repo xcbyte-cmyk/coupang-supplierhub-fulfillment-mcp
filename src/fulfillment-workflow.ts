@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { FulfillmentWorkflowMcpPort } from "./fulfillment-mcp.js";
-import { chooseAutomaticShipDate, planFulfillment } from "./fulfillment-planning.js";
+import { planFulfillment } from "./fulfillment-planning.js";
 import { FulfillmentStore } from "./fulfillment-store.js";
+import { resolveShipmentDispatchSchedule } from "./shipment-dispatch-schedule.js";
 import type {
   CenterMaster,
   ClassifiedFulfillmentOrder,
@@ -1876,9 +1877,10 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
       const hasUnknown = batches.some(
         (batch) =>
           batch.status === "unknown" ||
-          ["in_flight", "unknown", "submitted"].includes(
-            batch.waybillStatus ?? "not_started",
-          ),
+          (!["waybills_printed", "completed"].includes(batch.status) &&
+            ["in_flight", "unknown", "submitted"].includes(
+              batch.waybillStatus ?? "not_started",
+            )),
       );
       const firstWaybillFailure = batches.find(
         (batch) => batch.waybillStatus === "failed",
@@ -2096,9 +2098,20 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
         ) &&
         candidateSlipNos.length === batch.cartonCount &&
         new Set(candidateSlipNos).size === batch.cartonCount;
+      const requiresUserSelection =
+        exactCount &&
+        numberCandidates.some(
+          (candidate) =>
+            candidate.originalSlipNo &&
+            candidate.waybillNo &&
+            candidate.originalSlipNo !== candidate.waybillNo,
+        );
+      const autoCompleted = exactCount && !requiresUserSelection;
       const prePrintFailure = !result.success && result.status === "failed";
-      const outcomeStatus = exactCount
-        ? "unknown"
+      const outcomeStatus = autoCompleted
+        ? "waybills_printed"
+        : exactCount
+          ? "unknown"
         : result.status === "unknown" || result.success
           ? "unknown"
           : batch.status;
@@ -2107,8 +2120,10 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
         : prePrintFailure
           ? "failed"
           : "unknown";
-      const message = exactCount
-        ? `송장 ${numberCandidates.length}장 출력이 제출되었습니다. 원송장번호와 운송장번호를 사용자가 확인해야 합니다.`
+      const message = autoCompleted
+        ? `송장 ${numberCandidates.length}장 출력이 제출되었고 단일 송장번호 후보를 자동 확정했습니다.`
+        : exactCount
+          ? `송장 ${numberCandidates.length}장 출력이 제출되었습니다. 원송장번호와 운송장번호를 사용자가 확인해야 합니다.`
         : result.success
           ? `송장번호 후보 ${numberCandidates.length}개가 계획 카톤 ${batch.cartonCount}개와 일치하지 않습니다.`
           : result.message;
@@ -2132,11 +2147,12 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
           const candidate = numberCandidates.find(
             (item) => item.cartonIndex === carton.cartonIndex,
           )!;
+          const selectedSlipNo = candidate.waybillNo ?? candidate.originalSlipNo;
           this.store.updateFulfillmentCarton(batch.id, carton.cartonIndex, {
             originalSlipNo: candidate.originalSlipNo,
             waybillNo: candidate.waybillNo,
-            slipNo: undefined,
-            status: "unknown",
+            slipNo: autoCompleted ? selectedSlipNo : undefined,
+            status: autoCompleted ? "waybill_assigned" : "unknown",
             message,
             updatedAt: this.isoNow(),
           });
@@ -2161,20 +2177,24 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
         )
         .sort((left, right) => left.cartonIndex - right.cartonIndex);
       for (const job of mirrorJobs) {
+        const candidate = numberCandidates.find(
+          (item) => item.cartonIndex === job.cartonIndex,
+        );
+        const selectedSlipNo = candidate?.waybillNo ?? candidate?.originalSlipNo;
         const updated = prePrintFailure
           ? job
           : this.store.updateShippingJob(job.id, {
-              status: "unknown",
-              slipNo: undefined,
-              error: message,
-              waybillPrintedAt: undefined,
+              status: autoCompleted ? "waybill_printed" : "unknown",
+              slipNo: autoCompleted ? selectedSlipNo : undefined,
+              error: autoCompleted ? undefined : message,
+              waybillPrintedAt: autoCompleted ? this.isoNow() : undefined,
             });
         this.store.recordArtifact({
           runId,
           shippingJobId: updated.id,
           orderNo: updated.orderNo,
           type: "waybill_print",
-          status: prePrintFailure ? "failed" : "unknown",
+          status: prePrintFailure ? "failed" : autoCompleted ? "submitted" : "unknown",
           printerName: this.config.waybillPrinterName,
           submittedAt: exactCount ? this.isoNow() : undefined,
           message,
@@ -2189,9 +2209,10 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
     const unknownBatches = finalBatches.filter(
       (batch) =>
         batch.status === "unknown" ||
-        ["in_flight", "unknown", "submitted"].includes(
-          batch.waybillStatus ?? "not_started",
-        ),
+        (!["waybills_printed", "completed"].includes(batch.status) &&
+          ["in_flight", "unknown", "submitted"].includes(
+            batch.waybillStatus ?? "not_started",
+          )),
     ).length;
     const blockedBatches = finalBatches.filter((batch) =>
       ["blocked", "failed"].includes(batch.status) || batch.waybillStatus === "failed",
@@ -2230,8 +2251,6 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
   }> {
     const batches = this.store.getLogenBatches(runId);
     const today = dateInTimeZone(this.now(), "Asia/Seoul");
-    const requestedShipDate = normalizeOptionalShipDate(requestedShipDateInput);
-    const requestedShipTime = normalizeOptionalShipTime(requestedShipTimeInput);
     const existingJobs = this.store.getCoupangUploadJobs(runId);
     const confirmedGroupIds = new Set(
       existingJobs
@@ -2299,11 +2318,20 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
           job.shipmentGroupId === group.id ||
           (job.shipmentGroupIds ?? []).includes(group.id),
       );
-      const groupShipDate = requestedShipDate ?? savedGroupJob?.shipDate ?? today;
-      if (!chooseAutomaticShipDate(group.expectedInboundDate, groupShipDate)) {
+      try {
+        resolveShipmentDispatchSchedule({
+          requestedShipDate: requestedShipDateInput,
+          requestedShipTime: requestedShipTimeInput,
+          savedShipDate: savedGroupJob?.shipDate,
+          savedShipTime: savedGroupJob?.shipTime,
+          today,
+          defaultShipTime: this.config.shipTime,
+          expectedInboundDates: [group.expectedInboundDate],
+        });
+      } catch (error) {
         this.store.updateShipmentGroup(group.id, {
           status: "blocked",
-          message: `발송일 ${groupShipDate}은 이 그룹의 허용 출고일(EDD D-3~D-1)이 아닙니다.`,
+          message: errorMessage(error),
           updatedAt: this.isoNow(),
         });
         blockedGroups += 1;
@@ -2341,9 +2369,17 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
         newUploadGroups.map((group) => group.id),
       );
       let uploadJob = existingJobs.find((job) => job.id === uploadJobId);
-      const shipDate = requestedShipDate ?? uploadJob?.shipDate ?? today;
-      const shipTime =
-        requestedShipTime ?? uploadJob?.shipTime ?? this.config.shipTime ?? "16:00";
+      const { shipDate, shipTime } = resolveShipmentDispatchSchedule({
+        requestedShipDate: requestedShipDateInput,
+        requestedShipTime: requestedShipTimeInput,
+        savedShipDate: uploadJob?.shipDate,
+        savedShipTime: uploadJob?.shipTime,
+        today,
+        defaultShipTime: this.config.shipTime,
+        expectedInboundDates: newUploadGroups.map(
+          (group) => group.expectedInboundDate,
+        ),
+      });
       const unresolved =
         uploadJob && ["unknown", "failed", "uploaded"].includes(uploadJob.status)
           ? uploadJob
@@ -3176,34 +3212,6 @@ function dateInTimeZone(date: Date, timeZone: string): string {
   const day = values.get("day");
   if (!year || !month || !day) throw new Error(`${timeZone} 기준 날짜를 계산할 수 없습니다.`);
   return `${year}-${month}-${day}`;
-}
-
-function normalizeOptionalShipDate(value: string | undefined): string | undefined {
-  if (!value?.trim()) return undefined;
-  const normalized = value.trim();
-  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!match) throw new Error("발송일은 YYYY-MM-DD 형식이어야 합니다.");
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const candidate = new Date(Date.UTC(year, month - 1, day));
-  if (
-    candidate.getUTCFullYear() !== year ||
-    candidate.getUTCMonth() !== month - 1 ||
-    candidate.getUTCDate() !== day
-  ) {
-    throw new Error("발송일이 올바른 날짜가 아닙니다.");
-  }
-  return normalized;
-}
-
-function normalizeOptionalShipTime(value: string | undefined): string | undefined {
-  if (!value?.trim()) return undefined;
-  const normalized = value.trim();
-  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(normalized)) {
-    throw new Error("발송시간은 HH:mm 형식이어야 합니다.");
-  }
-  return normalized;
 }
 
 function positiveInteger(value: unknown): number | undefined {

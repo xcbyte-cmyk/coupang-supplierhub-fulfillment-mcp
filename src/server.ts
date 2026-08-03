@@ -84,10 +84,6 @@ const MCP_PATH = "/mcp";
 const PORT = Number(process.env.PORT ?? 4310);
 const HOST = "127.0.0.1";
 const dashboardHtml = readFileSync(join(PROJECT_ROOT, "public", "workflow.html"), "utf8");
-const conceptHtml = readFileSync(
-  join(PROJECT_ROOT, "public", "workflow-concept.html"),
-  "utf8",
-);
 const fulfillmentHtml = readFileSync(
   join(PROJECT_ROOT, "public", "fulfillment.html"),
   "utf8",
@@ -606,30 +602,6 @@ const httpServer = createServer(async (req, res) => {
     }
 
     const url = new URL(req.url, `http://${req.headers.host}`);
-
-    if (req.method === "GET" && url.pathname === "/") {
-      res.writeHead(200, {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-        "x-content-type-options": "nosniff",
-        "content-security-policy":
-          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
-      });
-      res.end(dashboardHtml);
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/concept") {
-      res.writeHead(200, {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-        "x-content-type-options": "nosniff",
-        "content-security-policy":
-          "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
-      });
-      res.end(conceptHtml);
-      return;
-    }
 
     if (req.method === "GET" && url.pathname === "/fulfillment") {
       res.writeHead(200, {

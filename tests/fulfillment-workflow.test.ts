@@ -143,6 +143,14 @@ class FakeLogen implements LogenPort, LogenBatchPort {
   legacyWaybillCalls = 0;
   throwLegacyWaybillAfterSubmit = false;
 
+  async openRegistration() {
+    return { status: "ready" as const, message: "login ready" };
+  }
+
+  async openSingleOrderRegistration() {
+    return { status: "ready" as const, message: "single order ready" };
+  }
+
   async registerBatches(
     batches: LogenBatch[],
     _sender: SenderProfile,
@@ -164,10 +172,13 @@ class FakeLogen implements LogenPort, LogenBatchPort {
     printerName: string,
   ): Promise<LogenBatchWaybillResult[]> {
     this.waybillCalls.push({ batches: structuredClone(batches), printerName });
-    return batches.map((batch) => ({
+    return batches.map((batch, batchIndex) => ({
       batchId: batch.id,
       fixTakeNo: batch.fixTakeNo,
-      slipNos: Array.from({ length: batch.cartonCount }, (_, index) => `SLIP-${index + 1}`),
+      slipNos: Array.from(
+        { length: batch.cartonCount },
+        (_, index) => String(44_800_000_000 + batchIndex * 100 + index + 1),
+      ),
       success: true,
       status: "submitted",
       message: "printed",
@@ -196,10 +207,10 @@ class FakeLogen implements LogenPort, LogenBatchPort {
     if (this.throwLegacyWaybillAfterSubmit) {
       throw new Error("connection lost after legacy waybill print submit");
     }
-    return jobs.map((job) => ({
+    return jobs.map((job, index) => ({
       shippingJobId: job.id,
       fixTakeNo: job.fixTakeNo,
-      slipNo: `SLIP-${job.cartonIndex}`,
+      slipNo: String(44_900_000_000 + index + 1),
       success: true,
       status: "submitted",
       message: "printed",
@@ -300,7 +311,7 @@ function makeHarness(orders: FulfillmentOrder[]): Harness {
 
 function seedRouting(store: FulfillmentStore): void {
   store.setSenderProfile({
-    name: "대령화학",
+    name: "테스트 공급사",
     address: "경기도 광주시 테스트로 1",
     telephone: "031-000-0000",
     customerCode: "99999999",
@@ -590,7 +601,7 @@ describe("FulfillmentWorkflow", () => {
     expect(harness.logen.waybillCalls).toHaveLength(1);
     expect(harness.logen.waybillCalls[0].printerName).toBe(ALLLIVE);
     expect(harness.supplierHub.trackingCalls).toEqual([
-      { orderNo: "PO-ROUTING", slipNos: ["SLIP-1", "SLIP-2"] },
+      { orderNo: "PO-ROUTING", slipNos: ["44800000001", "44800000002"] },
     ]);
 
     const run = await harness.workflow.getFulfillmentRun({ runId });
@@ -724,7 +735,7 @@ describe("FulfillmentWorkflow", () => {
       dataSource: "order_file",
     });
 
-    expect(result).toMatchObject({ id: runId, currentStage: 14, status: "completed" });
+    expect(result).toMatchObject({ id: runId, currentStage: 16, status: "completed" });
     expect(harness.logen.registerCalls).toHaveLength(1);
     expect(harness.logen.waybillCalls).toHaveLength(1);
   });

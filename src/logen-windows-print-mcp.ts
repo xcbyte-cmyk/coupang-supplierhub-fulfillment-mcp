@@ -13,9 +13,7 @@ const HOST = "127.0.0.1";
 const PORT = Number(process.env.LOGEN_WINDOWS_MCP_PORT ?? 4311);
 const MCP_PATH = "/mcp";
 const TOKEN = process.env.LOGEN_WINDOWS_MCP_TOKEN?.trim();
-const PRINTER_NAME =
-  process.env.LOGEN_WINDOWS_PRINTER?.trim() ??
-  "\\\\DESKTOP-EFG7BOL\\AllLive OLIVE-308B";
+const CONFIGURED_PRINTER_NAME = process.env.LOGEN_WINDOWS_PRINTER?.trim();
 const SCRIPT_PATH =
   process.env.LOGEN_WINDOWS_PRINT_SCRIPT?.trim() ??
   join(MODULE_ROOT, "scripts", "confirm-logen-oz-print.ps1");
@@ -40,6 +38,10 @@ if (process.platform !== "win32") {
 if (!TOKEN) {
   throw new Error("LOGEN_WINDOWS_MCP_TOKEN is required.");
 }
+if (!CONFIGURED_PRINTER_NAME) {
+  throw new Error("LOGEN_WINDOWS_PRINTER is required.");
+}
+const PRINTER_NAME: string = CONFIGURED_PRINTER_NAME;
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) {
   throw new Error("LOGEN_WINDOWS_MCP_PORT must be an integer between 1024 and 65535.");
 }

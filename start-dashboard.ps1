@@ -4,7 +4,7 @@ $dataDir = Join-Path $projectRoot 'data'
 $pidPath = Join-Path $dataDir 'server.pid'
 $stdoutPath = Join-Path $dataDir 'server.stdout.log'
 $stderrPath = Join-Path $dataDir 'server.stderr.log'
-$dashboardUrl = 'http://127.0.0.1:4310/'
+$dashboardUrl = 'http://127.0.0.1:4310/fulfillment'
 
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 

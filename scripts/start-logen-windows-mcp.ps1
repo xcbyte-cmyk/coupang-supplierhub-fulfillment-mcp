@@ -2,7 +2,8 @@
 param(
     [switch]$Elevated,
     [ValidateRange(1024, 65535)]
-    [int]$Port = 4311
+    [int]$Port = 4311,
+    [string]$PrinterName = $env:FULFILLMENT_WAYBILL_PRINTER
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +29,9 @@ if (-not $Elevated) {
         '-Elevated',
         '-Port', [string]$Port
     )
+    if (-not [string]::IsNullOrWhiteSpace($PrinterName)) {
+        $arguments += @('-PrinterName', ('"' + $PrinterName + '"'))
+    }
     Start-Process -FilePath 'pwsh.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments
     [pscustomobject]@{
         status = 'uac_requested'
@@ -39,6 +43,9 @@ if (-not $Elevated) {
 
 if (-not (Test-Administrator)) {
     throw 'The Logen Windows Print MCP must run with administrator privileges.'
+}
+if ([string]::IsNullOrWhiteSpace($PrinterName)) {
+    throw 'Set FULFILLMENT_WAYBILL_PRINTER or pass -PrinterName with the exact Windows printer name.'
 }
 if (-not (Test-Path -LiteralPath $entryPath -PathType Leaf)) {
     throw "Build output is missing: $entryPath"
@@ -56,7 +63,7 @@ if ($token.Length -lt 32) { throw 'The Logen Windows MCP token is invalid.' }
 
 $env:LOGEN_WINDOWS_MCP_TOKEN = $token
 $env:LOGEN_WINDOWS_MCP_PORT = [string]$Port
-$env:LOGEN_WINDOWS_PRINTER = '\\DESKTOP-EFG7BOL\AllLive OLIVE-308B'
+$env:LOGEN_WINDOWS_PRINTER = $PrinterName.Trim()
 
 $node = (Get-Command node.exe -ErrorAction Stop).Source
 $startParameters = @{
