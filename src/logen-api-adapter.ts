@@ -195,6 +195,37 @@ export class LogenOpenApiAdapter implements LogenPort, LogenBatchPort {
     });
   }
 
+  /**
+   * Resolve Logen's interactive test-print surface without returning the
+   * configured secret key to the dashboard. The caller must redirect the
+   * browser immediately; persisting this URL would expose the key in local
+   * application state.
+   */
+  async getTestInvoicePrintPopupUrl(): Promise<string> {
+    if (this.config.environment !== "test") {
+      throw new Error("개발계 로젠 시험 출력 팝업은 TEST 환경에서만 열 수 있습니다.");
+    }
+    this.assertReady("register");
+    const popupUrl = new URL(`${this.baseUrl}/outSlipPrintPop`);
+    popupUrl.searchParams.set("userId", this.userId());
+    popupUrl.searchParams.set("custCd", this.customerCode());
+    popupUrl.searchParams.set("takeDt", dateInSeoul(this.now()).replaceAll("-", ""));
+    const response = await this.fetchImpl(popupUrl, {
+      headers: { secretKey: this.secretKey() },
+    });
+    if (!response.ok) {
+      throw new Error(`로젠 개발계 출력 팝업 준비가 HTTP ${response.status}로 실패했습니다.`);
+    }
+    const html = await response.text();
+    const match = html.match(/window\.open\(\s*["']([^"']+)["']/i);
+    if (!match?.[1]) throw new Error("로젠 개발계 출력 팝업 주소를 확인하지 못했습니다.");
+    const resolved = new URL(match[1], popupUrl);
+    if (resolved.protocol !== "https:" || resolved.hostname !== "topenapi.ilogen.com") {
+      throw new Error("로젠 개발계 출력 팝업 주소가 예상한 개발계 도메인이 아닙니다.");
+    }
+    return resolved.toString();
+  }
+
   async registerOrders(
     jobs: ShippingJob[],
     sender: SenderProfile,

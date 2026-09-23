@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; img-src data:; form-action 'none'; base-uri 'none'">
+  <title>발주·배송 실습실 | Supplier Hub</title>
+  <style>
+<!-- INLINE_STYLES -->
+  </style>
+</head>
+<body>
+  <a class="skip" href="#lesson-title">실습 내용으로 바로가기</a>
+  <header class="topbar"><div class="top-inner">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9Z M4 7.5l8 4.5 8-4.5 M12 12v9 M8 5.2l8 4.5"/></svg></span>Supplier Hub <span class="brand-separator">/</span> 실습실</div>
+    <nav class="top-actions" aria-label="보조 메뉴"><span class="practice-tag"><span class="dot"></span>연습 전용</span><button class="text-button" id="help-button">사용 방법</button><a href="/fulfillment" target="_blank" rel="noopener">운영 화면 ↗</a></nav>
+  </div></header>
+  <main>
+    <section class="intro" aria-labelledby="page-title"><div><p class="eyebrow">WORKFLOW PRACTICE</p><h1 id="page-title">발주부터 배송까지, 직접 해보세요.</h1><p class="subtitle">샘플 발주로 익히는 16단계 업무 흐름. 모든 발주·송장·출력은 가상 예제입니다.</p></div>
+      <div class="overall"><div class="progress-line"><span>나의 실습 진행</span><strong id="progress-label">0 <span>/ 16</span></strong></div><div id="progress" class="progress-track" role="progressbar" aria-label="실습 진행률" aria-valuemin="0" aria-valuemax="16" aria-valuenow="0"><div class="progress-fill" id="progress-fill"></div></div><p class="progress-help" id="progress-help">첫 단계부터 차근차근 시작해 보세요.</p></div>
+    </section>
+    <div class="scenarios" role="group" aria-label="실습 예제 선택">
+      <button class="scenario" data-scenario="basic" aria-pressed="true"><span class="scenario-num">01</span><span><strong>신규 발주 전체 처리</strong><small>처음이라면 · 조회부터 문서 출력까지</small></span><span class="scenario-indicator" aria-hidden="true"></span></button>
+      <button class="scenario" data-scenario="confirmed" aria-pressed="false"><span class="scenario-num">02</span><span><strong>이미 확정된 발주</strong><small>응용 · 필요한 단계만 진행하기</small></span><span class="scenario-indicator" aria-hidden="true"></span></button>
+      <button class="scenario" data-scenario="shortage" aria-pressed="false"><span class="scenario-num">03</span><span><strong>재고가 부족한 경우</strong><small>응용 · 실제 출고할 수량 조정하기</small></span><span class="scenario-indicator" aria-hidden="true"></span></button>
+    </div>
+    <div class="layout">
+      <aside class="curriculum"><div class="curriculum-title"><h2>실습 순서</h2><span>16 STEPS</span></div><nav id="stage-nav" aria-label="실습 단계"></nav></aside>
+      <div class="workspace">
+        <section class="lesson" aria-labelledby="lesson-title"><div class="lesson-head"><div><div class="step-label" id="step-label"></div><h2 id="lesson-title" tabindex="-1"></h2><p id="lesson-description"></p></div><div class="lesson-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 4H5v17h14V4h-4 M9 3h6v4H9z M8 12h8 M8 16h5"/></svg></div></div>
+          <div class="lesson-body"><div id="exercise"></div><div id="feedback" class="feedback" role="status" aria-live="polite" hidden></div><div class="instruction" id="instruction"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6 M12 7h.01"/></svg><p id="lesson-tip"></p></div></div>
+          <div class="lesson-actions"><small id="action-note">샘플 데이터로 진행하는 실습입니다.</small><div class="buttons"><button class="button" id="previous">이전 단계</button><button class="button primary" id="execute"></button></div></div>
+        </section>
+        <div class="secondary-grid">
+          <section class="panel"><h3>이번 실습의 처리 현황</h3><div class="metrics"><div class="metric"><strong id="order-count">0<em>건</em></strong><span>선택한 발주</span></div><div class="metric"><strong id="carton-count">0<em>개</em></strong><span>출고 카톤</span></div><div class="metric"><strong id="waybill-count">0<em>장</em></strong><span>연습 송장</span></div></div><ul class="lesson-log" id="lesson-log" aria-label="최근 실습 기록"><li>아직 실행한 단계가 없습니다.</li></ul></section>
+          <aside class="panel"><h3>알아두면 쉬워요</h3><div class="help-pair"><strong>발주</strong><span>센터에서 요청한 상품과 수량의 단위</span></div><div class="help-pair"><strong>카톤</strong><span>상품을 포장하는 상자. 수량 ÷ 입수수량으로 계산</span></div><div class="help-pair"><strong>쉽먼트</strong><span>발주별로 연결하는 쿠팡의 입고 배송 정보</span></div><p style="margin-top:11px">완료한 단계는 이 브라우저에 자동 저장됩니다.<br>다음 방문에도 이어서 연습할 수 있습니다.</p></aside>
+        </div>
+      </div>
+    </div>
+    <footer class="footer"><span>예제의 상품명·센터·발주번호·송장번호는 모두 가상입니다.</span><button class="text-button" id="reset-button">이 실습 처음부터 다시 하기 ↺</button></footer>
+  </main>
+  <dialog class="dialog" id="help-dialog"><h2>이렇게 연습해 보세요</h2><ol><li>위에서 연습할 예제를 선택합니다.</li><li>단계별 설명을 읽고 파란 버튼을 누릅니다.</li><li>샘플 결과를 확인한 뒤 다음 단계로 이동합니다.</li><li>모든 단계를 마치면 실습 결과를 저장할 수 있습니다.</li></ol><p>발주 선택과 확정수량을 직접 바꿔볼 수 있습니다. 연습 중에는 실제 로그인·주문등록·인쇄가 실행되지 않습니다.</p><div class="buttons"><button class="button primary" id="close-help">확인했어요</button></div></dialog>
+  <dialog class="dialog" id="reset-dialog"><h2>새 실습을 시작할까요?</h2><p>현재 예제의 연습 기록과 입력값을 비우고 첫 단계부터 시작합니다.</p><div class="buttons"><button class="button" id="cancel-reset">계속 연습하기</button><button class="button primary" id="confirm-reset">처음부터 시작</button></div></dialog>
+  <script>
+<!-- INLINE_SCRIPT -->
+  </script>
+</body>
+</html>

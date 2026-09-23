@@ -71,6 +71,16 @@ export function migrateFulfillmentDatabase(db: DatabaseSync): void {
       sku_code TEXT PRIMARY KEY, sku_name TEXT NOT NULL, units_per_carton INTEGER NOT NULL,
       source TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS product_master_changes (
+      id TEXT PRIMARY KEY, run_id TEXT REFERENCES fulfillment_runs(id) ON DELETE SET NULL,
+      sku_code TEXT NOT NULL, previous_units INTEGER, units_per_carton INTEGER NOT NULL,
+      confirmed_at TEXT NOT NULL, confirmation TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS fulfillment_carton_order_reviews (
+      run_id TEXT NOT NULL REFERENCES fulfillment_runs(id) ON DELETE CASCADE,
+      order_no TEXT NOT NULL, sku_code TEXT NOT NULL, review_json TEXT NOT NULL,
+      PRIMARY KEY (run_id, order_no, sku_code)
+    );
     CREATE TABLE IF NOT EXISTS center_master (
       center_code TEXT PRIMARY KEY, center_name TEXT NOT NULL, recipient_name TEXT NOT NULL,
       address TEXT NOT NULL, telephone TEXT NOT NULL, mobile TEXT, postal_code TEXT,

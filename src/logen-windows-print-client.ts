@@ -33,12 +33,50 @@ export interface LogenWindowsPrintMcpClientConfig {
   endpoint: string;
   tokenFile?: string;
   token?: string;
+  autoStart?: () => Promise<void>;
+  autoStartTimeoutMs?: number;
 }
 
 export class LogenWindowsPrintMcpClient implements LogenWindowsPrintDialogPort {
   constructor(private readonly config: LogenWindowsPrintMcpClientConfig) {}
 
   async health(): Promise<{ ready: boolean; message: string }> {
+    const first = await this.probeHealth();
+    if (first.ready || !first.unreachable || !this.config.autoStart) {
+      return { ready: first.ready, message: first.message };
+    }
+    try {
+      await this.config.autoStart();
+    } catch (error) {
+      return {
+        ready: false,
+        message: `로젠 Windows MCP 자동 시작을 요청하지 못했습니다: ${errorMessage(error)}`,
+      };
+    }
+
+    const deadline = Date.now() + (this.config.autoStartTimeoutMs ?? 30_000);
+    let latest = first;
+    while (Date.now() < deadline) {
+      await delay(250);
+      latest = await this.probeHealth();
+      if (latest.ready) {
+        return {
+          ready: true,
+          message: "로젠 Windows MCP를 자동으로 시작해 인쇄 준비를 완료했습니다.",
+        };
+      }
+    }
+    return {
+      ready: false,
+      message: `로젠 Windows MCP 자동 시작이 완료되지 않았습니다. Windows UAC를 허용한 뒤 다시 실행하세요. ${latest.message}`,
+    };
+  }
+
+  private async probeHealth(): Promise<{
+    ready: boolean;
+    message: string;
+    unreachable: boolean;
+  }> {
     try {
       const token = await this.token();
       const endpoint = new URL(this.config.endpoint);
@@ -50,14 +88,27 @@ export class LogenWindowsPrintMcpClient implements LogenWindowsPrintDialogPort {
         return {
           ready: false,
           message: `로젠 Windows MCP 상태 확인 실패: HTTP ${response.status}`,
+          unreachable: false,
         };
       }
       const body = (await response.json()) as { status?: string };
       return body.status === "ready"
-        ? { ready: true, message: "관리자 권한 로젠 Windows MCP가 준비되었습니다." }
-        : { ready: false, message: "로젠 Windows MCP가 준비 상태를 반환하지 않았습니다." };
+        ? {
+            ready: true,
+            message: "관리자 권한 로젠 Windows MCP가 준비되었습니다.",
+            unreachable: false,
+          }
+        : {
+            ready: false,
+            message: "로젠 Windows MCP가 준비 상태를 반환하지 않았습니다.",
+            unreachable: false,
+          };
     } catch (error) {
-      return { ready: false, message: `로젠 Windows MCP에 연결할 수 없습니다: ${errorMessage(error)}` };
+      return {
+        ready: false,
+        message: `로젠 Windows MCP에 연결할 수 없습니다: ${errorMessage(error)}`,
+        unreachable: true,
+      };
     }
   }
 
@@ -128,4 +179,8 @@ export class LogenWindowsPrintMcpClient implements LogenWindowsPrintDialogPort {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }

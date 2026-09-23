@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { FulfillmentStage } from "./fulfillment-types.js";
+import type { ConfirmCartonOrderReviewInput } from "./carton-order-review.js";
+import type { FulfillmentStage, ProductUnitsUpdate, RegistrationPreviewInput } from "./fulfillment-types.js";
 
 export type FulfillmentLookAheadDays = 7 | 30;
 export type FulfillmentDataSource = "auto" | "backend" | "order_file";
@@ -14,6 +15,9 @@ export type LogenIntegrationMethod = "api" | "website_mcp";
  * independently testable.
  */
 export interface FulfillmentWorkflowMcpPort {
+  confirmCartonOrderReview(input: ConfirmCartonOrderReviewInput): Promise<FulfillmentToolResult>;
+  previewLogenRegistration(input: RegistrationPreviewInput): Promise<FulfillmentToolResult>;
+  saveProductCartonUnits(input: { runId: string; updates: ProductUnitsUpdate[]; confirmed: boolean }): Promise<FulfillmentToolResult>;
   openSupplierHub(): Promise<FulfillmentToolResult>;
   openLogenLogin(input: {
     runId: string;
@@ -56,6 +60,7 @@ export interface FulfillmentWorkflowMcpPort {
     dataSource: FulfillmentDataSource;
     logenMethod?: LogenIntegrationMethod;
     refreshMaster?: boolean;
+    reviewToken?: string;
   }): Promise<FulfillmentToolResult>;
   printLogenWaybill(input: {
     runId: string;
@@ -148,6 +153,39 @@ export function registerFulfillmentMcpTools(
   server: McpServer,
   workflow: FulfillmentWorkflowMcpPort,
 ): void {
+  server.registerTool("confirm_carton_order_review", {
+    title: "발주서 포장 기준 확인 저장",
+    description: "Persist operator review of each current PO file and applied carton units. Missing or conflicting evidence requires a note. Does not register deliveries or update the SKU master.",
+    inputSchema: { runId: runIdSchema, dataSource: dataSourceSchema, confirmed: z.literal(true),
+      reviews: z.array(z.object({ orderNo: z.string().min(1), skuCode: z.string().min(1), evidenceToken: z.string().min(1),
+        unitsPerCarton: z.number().int().positive(), note: z.string().max(1000) })).min(1).max(100) },
+    outputSchema: fulfillmentOutputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+  }, async input => fulfillmentReply(await workflow.confirmCartonOrderReview(input), "발주서 확인을 저장했습니다."));
+  server.registerTool("preview_logen_registration", {
+    title: "13단계 입수수량·등록 계획 확인",
+    description: "Read the current run's carton units, source, related-product suggestions, recipient and registration history. Draft units are calculation only and never saved or submitted.",
+    inputSchema: {
+      runId: runIdSchema, dataSource: dataSourceSchema, logenMethod: logenMethodSchema.optional(),
+      draftUnits: z.array(z.object({ skuCode: z.string().min(1), unitsPerCarton: z.number().int().positive() })).max(100).optional(),
+    },
+    outputSchema: fulfillmentOutputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+  }, async (input) => fulfillmentReply(await workflow.previewLogenRegistration(input), "등록 계획을 확인했습니다."));
+  server.registerTool("save_product_carton_units", {
+    title: "확인한 SKU 입수수량 저장",
+    description: "Save operator-confirmed carton units with an audit record. Does not register deliveries, clear runs, or modify previously registered carton snapshots. Suggestions require operator confirmation.",
+    inputSchema: {
+      runId: runIdSchema, confirmed: z.literal(true),
+      updates: z.array(z.object({
+        skuCode: z.string().min(1), unitsPerCarton: z.number().int().positive(),
+        expectedUnitsPerCarton: z.number().int().nonnegative().nullable(), expectedUpdatedAt: z.string().nullable(),
+      })).min(1).max(100),
+    },
+    outputSchema: fulfillmentOutputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+  }, async (input) => fulfillmentReply(await workflow.saveProductCartonUnits(input), "포장 기준을 저장했습니다."));
+
   server.registerTool(
     "open_supplierhub",
     {
@@ -488,6 +526,7 @@ export function registerFulfillmentMcpTools(
         dataSource: dataSourceSchema,
         logenMethod: logenMethodSchema.optional(),
         refreshMaster: z.boolean().optional(),
+        reviewToken: z.string().min(1).optional(),
         orderNos: calibrationOrderNosSchema,
       },
       outputSchema: fulfillmentOutputSchema,
@@ -498,13 +537,14 @@ export function registerFulfillmentMcpTools(
         openWorldHint: true,
       },
     },
-    async ({ runId, dataSource, logenMethod, refreshMaster }) =>
+    async ({ runId, dataSource, logenMethod, refreshMaster, reviewToken }) =>
       fulfillmentReply(
         await workflow.registerLogenDeliveryOrder({
           runId,
           dataSource,
           logenMethod,
           refreshMaster,
+          reviewToken,
         }),
         "Logen delivery orders registered.",
       ),

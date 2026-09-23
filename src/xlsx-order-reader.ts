@@ -102,7 +102,7 @@ function readPrintLayoutSender(
   rows: Array<Map<number, string>>,
 ): Partial<OrderFileSenderProfile> {
   const name = normalizeVendorName(valueAfterLabel(rows, /^거래처명$/i));
-  const address = valueAfterLabel(rows, /^회송지주소$/i);
+  const address = valueAfterLabel(rows, /^회송(?:지)?주소$/i);
   const telephone = valueAfterLabel(rows, /^전화번호$/i);
   const mobile = valueAfterLabel(rows, /^회송담당자연락처$/i);
   return {
@@ -130,7 +130,7 @@ function readPrintLayoutOrder(
     ? locatePrintColumns(centerHeader, {
         center: /^물류센터$/i,
         address: /^주소$/i,
-        recipientTelephone: /^택배수령담당자$/i,
+        recipientTelephone: /^택배(?:수령)?담당자$/i,
       })
     : {};
   const expectedInboundDateColumns = centerHeader
@@ -367,6 +367,83 @@ function readSharedStrings(zip: AdmZip): string[] {
       .map((text) => decodeXml(text[1]))
       .join(""),
   );
+}
+
+/** Explicit pack-size columns only. Shipped/ordered quantities are displayed as context, never inferred as carton units. */
+export interface CartonWorkbookSheet {
+  sheet: string;
+  rows: Array<Map<number, string>>;
+  rowNumbers: number[];
+}
+
+export type CartonWorkbookEvidence = {
+  values: Array<{ unitsPerCarton: number; location: string; label: string }>;
+  notes: Array<{ location: string; text: string }>;
+};
+
+/** Parses every worksheet once so evidence for many SKUs can be read without re-unzipping. */
+export function parseCartonWorkbook(bytes: Buffer): CartonWorkbookSheet[] {
+  const zip = new AdmZip(bytes);
+  const strings = readSharedStrings(zip);
+  const workbook = zip.getEntry("xl/workbook.xml")?.getData().toString("utf8") ?? "";
+  const rels = zip.getEntry("xl/_rels/workbook.xml.rels")?.getData().toString("utf8") ?? "";
+  const relationships = [...rels.matchAll(/<Relationship\b([^>]*)\/?\s*>/g)];
+  const sheetNames = new Map<string, string>();
+  for (const match of workbook.matchAll(/<sheet\b([^>]*)\/?\s*>/g)) {
+    const name = /\bname="([^"]+)"/.exec(match[1])?.[1];
+    const id = /\br:id="([^"]+)"/.exec(match[1])?.[1];
+    const rel = relationships.find(value => /\bId="([^"]+)"/.exec(value[1])?.[1] === id);
+    const target = rel && /\bTarget="([^"]+)"/.exec(rel[1])?.[1];
+    if (name && target) sheetNames.set(target.startsWith("/") ? target.slice(1) : `xl/${target.replace(/^\.\//, "")}`, decodeXml(name));
+  }
+  return zip.getEntries().filter(value => /^xl\/worksheets\/[^/]+\.xml$/i.test(value.entryName)).map(entry => {
+    const xml = entry.getData().toString("utf8");
+    return {
+      sheet: sheetNames.get(entry.entryName) ?? entry.entryName.split("/").pop()!,
+      rows: readWorksheetRows(xml, strings),
+      rowNumbers: [...xml.matchAll(/<row\b([^>]*)>/g)].map((match, index) => Number(/\br="(\d+)"/.exec(match[1])?.[1] ?? index + 1)),
+    };
+  });
+}
+
+export function extractCartonEvidence(sheets: CartonWorkbookSheet[], orderNo: string, skuCode: string): CartonWorkbookEvidence {
+  const result: CartonWorkbookEvidence = { values: [], notes: [] };
+  for (const { sheet, rows, rowNumbers } of sheets) {
+    const location = (column: number, row: number) => {
+      let letters = "";
+      for (let n = column; n > 0; n = Math.floor((n - 1) / 26)) letters = String.fromCharCode(65 + (n - 1) % 26) + letters;
+      return `${sheet}!${letters}${row}`;
+    };
+    let skuColumn: number | undefined, orderColumn: number | undefined;
+    let packColumns: Array<[number, string]> = [];
+    rows.forEach((row, index) => {
+      const entries = [...row.entries()];
+      const skuHeader = entries.find(([, value]) => /^(?:SKU\s*(?:ID|Code)|상품코드|상품번호)$/i.test(textValue(value)));
+      if (skuHeader) {
+        skuColumn = skuHeader[0];
+        orderColumn = entries.find(([, value]) => /^(?:PO\s*ID|발주번호)$/i.test(textValue(value)))?.[0];
+        packColumns = entries.filter(([, value]) => /^(?:카톤(?:당)?입수(?:수량)?|입수(?:수량)?|박스당수량|박스입수(?:수량)?|카톤당수량|UnitsPerCarton|QtyPerCarton|PackSize)(?:\(개\))?$/i.test(textValue(value).replace(/\s+/g, "")));
+      } else if (skuColumn !== undefined && textValue(row.get(skuColumn)) === skuCode &&
+        (orderColumn === undefined || textValue(row.get(orderColumn)) === orderNo)) {
+        for (const [column, label] of packColumns) {
+          const raw = textValue(row.get(column)).replace(/,/g, "");
+          const match = /^(\d+)\s*(?:개(?:입)?)?$/.exec(raw);
+          const units = match ? Number(match[1]) : 0;
+          if (Number.isSafeInteger(units) && units > 0) result.values.push({ unitsPerCarton: units, label, location: location(column, rowNumbers[index]) });
+        }
+      }
+      for (const [column, text] of entries) {
+        if (result.notes.length < 12 && /입수|카톤|포장|박스|carton|출고수량|Shipped Qty/i.test(text) && text.length > 10) {
+          result.notes.push({ location: location(column, rowNumbers[index]), text: text.slice(0, 1200) });
+        }
+      }
+    });
+  }
+  return result;
+}
+
+export function readCartonWorkbookEvidence(bytes: Buffer, orderNo: string, skuCode: string): CartonWorkbookEvidence {
+  return extractCartonEvidence(parseCartonWorkbook(bytes), orderNo, skuCode);
 }
 
 function readWorksheetRows(xml: string, sharedStrings: string[]): Array<Map<number, string>> {

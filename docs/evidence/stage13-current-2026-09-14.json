@@ -1,0 +1,128 @@
+{
+  "inspectedAt": "2026-09-14T01:21:00.873Z",
+  "readOnly": true,
+  "run": {
+    "id": "run-a19f4407-405",
+    "status": "blocked",
+    "current_stage": 14,
+    "workflow_version": 3,
+    "logen_integration_method": "website_mcp",
+    "last_error": "출력할 로젠 PO·SKU 배치가 없습니다."
+  },
+  "dataSource": "auto",
+  "products": [
+    {
+      "orderNo": "140802144",
+      "skuCode": "70924435",
+      "skuName": "코멧 홈 BPA FREE TPU 걸이형 양면 도마_L_차콜",
+      "orderedQuantity": 200,
+      "backendUnits": null,
+      "backendSource": null,
+      "orderFileUnits": null,
+      "assumedUnits": null,
+      "effectiveUnits": null,
+      "effectiveSource": "missing"
+    }
+  ],
+  "downloadedOrderFiles": [
+    {
+      "orderNo": "140802144",
+      "fileName": "발주서_140802144.xlsx",
+      "items": [
+        {
+          "skuCode": "70924435",
+          "orderedQuantity": 200,
+          "unitsPerCarton": null
+        }
+      ]
+    }
+  ],
+  "plan": {
+    "status": "blocked",
+    "batchCount": 1,
+    "cartonCount": 0,
+    "batches": [
+      {
+        "orderNo": "140802144",
+        "skuCode": "70924435",
+        "orderedQuantity": 200,
+        "unitsPerCarton": 0,
+        "cartonCount": 0,
+        "status": "blocked",
+        "message": "입수수량이 없습니다."
+      }
+    ],
+    "note": "카톤 계산 결과입니다. 로젠 로그인·수취 정보·운임·외부 저장·출력 성공을 의미하지 않습니다."
+  },
+  "stages": [
+    {
+      "stage": 4,
+      "status": "completed",
+      "message": "처리 가능한 발주 1건을 워크플로 v2 실행 run-a19f4407-405에 연결했습니다.",
+      "updated_at": "2026-09-14T00:36:17.951Z"
+    },
+    {
+      "stage": 5,
+      "status": "completed",
+      "message": "확정 대상 발주 1건의 발주서 업로드 양식을 다운로드했습니다.",
+      "updated_at": "2026-09-14T00:36:29.169Z"
+    },
+    {
+      "stage": 6,
+      "status": "completed",
+      "message": "발주 1건, 1개 행의 확정수량을 준비했습니다. 업로드는 실행하지 않았습니다.",
+      "updated_at": "2026-09-14T00:36:35.557Z"
+    },
+    {
+      "stage": 7,
+      "status": "completed",
+      "message": "발주 1건이 발주확정 상태입니다.",
+      "updated_at": "2026-09-14T00:37:38.559Z"
+    },
+    {
+      "stage": 8,
+      "status": "completed",
+      "message": "발주서 1개를 다운로드했습니다. ZIP·XLSX 내용 검수는 수행하지 않았습니다.",
+      "updated_at": "2026-09-14T00:39:40.289Z"
+    },
+    {
+      "stage": 9,
+      "status": "completed",
+      "message": "SINDOH N600 Series PCL-8에 1개 파일의 인쇄 요청을 제출했습니다.",
+      "updated_at": "2026-09-14T00:39:55.225Z"
+    },
+    {
+      "stage": 10,
+      "status": "completed",
+      "message": "발주 1건의 인쇄 제출 결과를 기록했습니다.",
+      "updated_at": "2026-09-14T00:40:49.337Z"
+    },
+    {
+      "stage": 11,
+      "status": "completed",
+      "message": "로젠 로그인 후 메인 화면으로 이동했습니다.",
+      "updated_at": "2026-09-14T00:43:44.735Z"
+    },
+    {
+      "stage": 12,
+      "status": "completed",
+      "message": "예약관리의 주문등록/출력(단건) 화면으로 이동했습니다.",
+      "updated_at": "2026-09-14T00:43:49.155Z"
+    },
+    {
+      "stage": 13,
+      "status": "blocked",
+      "message": "웹사이트 MCP로 PO·SKU 로젠 배치 0건을 등록했고 1건은 중단, 0건은 결과 불명확입니다. 카톤 계획은 0건입니다. 중단 사유: 입수수량이 없습니다.",
+      "updated_at": "2026-09-14T00:43:52.627Z"
+    },
+    {
+      "stage": 14,
+      "status": "blocked",
+      "message": "출력할 로젠 PO·SKU 배치가 없습니다.",
+      "updated_at": "2026-09-14T00:43:59.237Z"
+    }
+  ],
+  "databaseWrites": 0,
+  "externalRequests": 0,
+  "assumptionsAppliedToProduction": false
+}

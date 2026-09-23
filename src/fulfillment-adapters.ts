@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { rowSignature, waitForChangedRows, waitForTableIdle, waitForVisibleCandidates } from "./browser-readiness.js";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { access, mkdir, stat, writeFile } from "node:fs/promises";
@@ -300,7 +301,7 @@ export const DEFAULT_SUPPLIER_SELECTORS: SupplierHubBrowserSelectors = {
     'h1:has-text("Private Label 발주 리스트"), h2:has-text("Private Label 발주 리스트"), h3:has-text("Private Label 발주 리스트")',
   orderRows: "table tbody tr",
   orderNumberInput: 'input[placeholder="발주번호를 (,)로 구분하여 입력해주세요"]',
-  orderSearchButton: 'button:has-text("검색")',
+  orderSearchButton: 'button:text-is("검색")',
   dateSearchTypeInput:
     'label:text-is("기간검색") + div input[role="combobox"]',
   inboundDateStartInput: 'input[placeholder="Start date"]',
@@ -714,6 +715,7 @@ export class SupplierHubFulfillmentBrowserAdapter
       config.headless ?? false,
       config.chromeConnection ?? "playwright",
       config.chromeExecutablePath,
+      true,
     );
   }
 
@@ -751,6 +753,7 @@ export class SupplierHubFulfillmentBrowserAdapter
       const connection = await this.privateLabelConnection(page);
       if (connection.status !== "ready") return { connection, orders: [] };
       await page.waitForTimeout(SUPPLIER_ORDER_PAGE_SETTLE_MS);
+      await waitForTableIdle(page);
 
       if (query.dateSearchType === "order_date") {
         const dateSearchTypeInput = await requireUniqueVisible(
@@ -790,7 +793,7 @@ export class SupplierHubFulfillmentBrowserAdapter
         );
         await startInput.fill(query.dateFrom);
         await endInput.fill(query.dateTo);
-        await page.waitForTimeout(SUPPLIER_ORDER_FILTER_SETTLE_MS);
+        await closeSupplierDatePicker(page);
       } else {
         const quickRangeLabel = query.lookAheadDays === 7 ? "다음 7일" : "다음 30일";
         const rangeButton = page.getByRole("button", {
@@ -813,6 +816,7 @@ export class SupplierHubFulfillmentBrowserAdapter
       );
       await search.click();
       await page.waitForTimeout(SUPPLIER_ORDER_RESULTS_SETTLE_MS);
+      await waitForTableIdle(page);
 
       const orders = await this.collectAllOrderPages(page);
       return {
@@ -1212,6 +1216,12 @@ export class SupplierHubFulfillmentBrowserAdapter
   }
 
   private async privateLabelConnection(page: Page): Promise<FulfillmentConnectionResult> {
+    // DOMContentLoaded does not mean the Supplier Hub SPA has rendered its list.
+    // Re-read URL/auth state after waiting: an expired session can redirect here.
+    if (page.url().includes("/po-web/cplb/po/list")) {
+      await page.locator(this.selectors.readyHeading).first()
+        .waitFor({ state: "visible", timeout: 15_000 }).catch(() => undefined);
+    }
     const url = page.url();
     const accessDenied = await page
       .locator("body")
@@ -1252,7 +1262,7 @@ export class SupplierHubFulfillmentBrowserAdapter
     }
     return {
       status: "blocked",
-      message: "Private Label 발주 화면을 확인하지 못했습니다. 셀렉터 교정이 필요합니다.",
+      message: "발주 목록 제목이 15초 안에 표시되지 않았습니다. 열린 쿠팡 창의 로딩·로그인·오류 안내를 확인한 뒤 1단계 접속을 다시 실행하세요. 목록이 정상 표시되는데도 반복되면 화면 판별 조건을 점검해야 합니다.",
       url,
     };
   }
@@ -1358,8 +1368,10 @@ export class SupplierHubFulfillmentBrowserAdapter
       ) {
         break;
       }
+      const rows = page.locator(this.selectors.orderRows);
+      const previous = await rowSignature(rows);
       await nextButton.click();
-      await page.waitForTimeout(700);
+      await waitForChangedRows(page, rows, previous);
     }
     return [...collected.values()];
   }
@@ -1404,6 +1416,7 @@ export class SupplierHubFulfillmentBrowserAdapter
     );
     await search.click();
     await page.waitForTimeout(800);
+    await waitForTableIdle(page);
     const row = await requireUniqueVisible(
       page.locator(rowsSelector).filter({ hasText: orderNo }),
       `발주 ${orderNo}의 쉽먼트 행`,
@@ -1427,16 +1440,18 @@ export class SupplierHubFulfillmentBrowserAdapter
     type DownloadStartOutcome =
       | { kind: "download"; download: Download }
       | { kind: "confirmation" }
-      | { kind: "timeout" };
+      | { kind: "no_confirmation" }
+      | { kind: "failed"; error: unknown };
     const acceptNativeConfirmation = (dialog: Dialog) => {
-      if (dialog.type() === "confirm") void dialog.accept();
-      else void dialog.dismiss();
+      if (dialog.type() === "confirm") void dialog.accept().catch(() => undefined);
+      else void dialog.dismiss().catch(() => undefined);
     };
     page.once("dialog", acceptNativeConfirmation);
-    const pendingDownload = page.waitForEvent("download", { timeout: 30_000 });
+    // Observe failure immediately, even if clicking/confirmation fails first.
+    const pendingDownload: Promise<DownloadStartOutcome> = page.waitForEvent("download", { timeout: 30_000 })
+      .then(download => ({ kind: "download" as const, download }), error => ({ kind: "failed" as const, error }));
     const racers: Array<Promise<DownloadStartOutcome>> = [
-      pendingDownload.then((download) => ({ kind: "download", download })),
-      page.waitForTimeout(10_000).then(() => ({ kind: "timeout" })),
+      pendingDownload,
     ];
     if (confirmSelector) {
       racers.push(
@@ -1444,31 +1459,25 @@ export class SupplierHubFulfillmentBrowserAdapter
           .locator(confirmSelector)
           .first()
           .waitFor({ state: "visible", timeout: 10_000 })
-          .then(() => ({ kind: "confirmation" })),
+          .then(() => ({ kind: "confirmation" as const }), () => ({ kind: "no_confirmation" as const })),
       );
     }
 
-    let outcome: DownloadStartOutcome;
     try {
       await button.click();
-      outcome = await Promise.race(racers);
+      let outcome = await Promise.race(racers);
+      if (outcome.kind === "confirmation" && confirmSelector) {
+        const confirm = await requireUniqueVisible(page.locator(confirmSelector), "다운로드 확인 버튼");
+        await confirm.click();
+        outcome = await pendingDownload;
+      } else if (outcome.kind === "no_confirmation") {
+        outcome = await pendingDownload;
+      }
+      if (outcome.kind === "download") return outcome.download;
+      throw new FulfillmentAdapterBlockedError("다운로드 시작을 30초 안에 확인하지 못했습니다. 열린 창의 안내와 다운로드 목록을 확인하세요.");
     } finally {
       page.off("dialog", acceptNativeConfirmation);
     }
-    if (outcome.kind === "download") return outcome.download;
-    if (outcome.kind === "timeout" || !confirmSelector) {
-      throw new FulfillmentAdapterBlockedError(
-        confirmSelector
-          ? "발주서 버튼 클릭 후 다운로드 또는 확인창이 10초 안에 나타나지 않았습니다."
-          : "다운로드가 시작되지 않았고 확인 버튼 셀렉터도 설정되지 않았습니다.",
-      );
-    }
-    const confirm = await requireUniqueVisible(
-      page.locator(confirmSelector),
-      "다운로드 확인 버튼",
-    );
-    await confirm.click();
-    return await pendingDownload;
   }
 
   private async trackingSaveConfirmed(
@@ -1515,6 +1524,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
       config.headless ?? false,
       config.chromeConnection ?? "playwright",
       config.chromeExecutablePath,
+      true,
     );
   }
 
@@ -1537,7 +1547,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
   async open(): Promise<FulfillmentConnectionResult> {
     try {
       const page = await this.session.open(this.homeUrl);
-      await page.bringToFront();
+      await this.session.bringToFront(page);
       return await this.connectionStatus(page);
     } catch (error) {
       return { status: "error", message: errorMessage(error) };
@@ -1565,7 +1575,6 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
         .locator(requiredConfig(this.selectors.readyMarker, "로젠 로그인 완료 표시 셀렉터"))
         .waitFor({ state: "visible", timeout: LOGEN_MAIN_READY_TIMEOUT_MS })
         .catch(() => undefined);
-      await page.waitForTimeout(1_000);
       await this.session.bringToFront(page);
       const connection = await this.connectionStatus(page);
       if (connection.status !== "ready") return connection;
@@ -1584,7 +1593,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
       const page = await this.session.open(
         requiredConfig(this.config.waybillUrl, "로젠 송장출력 URL"),
       );
-      await page.bringToFront();
+      await this.session.bringToFront(page);
       return await this.connectionStatus(page);
     } catch (error) {
       return { status: "error", message: errorMessage(error) };
@@ -1596,11 +1605,11 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
       const page = await this.session.open(
         this.config.waybillUrl?.trim() || LOGEN_MAIN_URL,
       );
-      await page.bringToFront();
+      await this.session.bringToFront(page);
       await this.requireReady(page);
       const registrationSurface = await this.openRegistrationSurface(page);
       this.rememberRegistrationSurface(registrationSurface);
-      await this.registrationPage?.bringToFront();
+      if (this.registrationPage) await this.session.bringToFront(this.registrationPage);
       return {
         status: "ready",
         message: "예약관리의 주문등록/출력(단건) 화면으로 이동했습니다.",
@@ -1671,8 +1680,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
           noPrintFilter,
           "로젠 미출력 필터",
         );
-        await registrationSurface.waitForTimeout(1_000);
-        const beforeRows = await this.readSingleOrderRows(registrationSurface);
+        const beforeRows = await this.refreshSingleOrderRows(registrationSurface);
 
         const newButton = await requireUniqueVisible(
           registrationSurface.locator(
@@ -1705,6 +1713,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
           "로젠 주문등록 완료 확인 버튼",
         );
         await confirmation.click();
+        await this.refreshSingleOrderRows(registrationSurface);
 
         const registeredRows = await this.waitForNewRegistrationRows(
           registrationSurface,
@@ -1845,18 +1854,8 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
   ): Promise<LogenBatchWaybillInspectionResult[]> {
     let registrationSurface: Page | Frame;
     try {
-      registrationSurface = await this.requireRememberedRegistrationSurface();
-      const search = await requireUniqueVisible(
-        registrationSurface.locator(
-          requiredConfig(
-            this.selectors.registrationSearchButton,
-            "로젠 조회(F2) 버튼 셀렉터",
-          ),
-        ),
-        "로젠 조회(F2) 버튼",
-      );
-      await search.click();
-      await registrationSurface.waitForTimeout(1_000);
+      registrationSurface = await this.ensureRegistrationSurface();
+      await this.refreshSingleOrderRows(registrationSurface);
     } catch (error) {
       return batches.map((batch) => ({
         batchId: batch.id,
@@ -1884,6 +1883,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
         ];
         if (registrationKeys.length !== batch.cartonCount) {
           await this.setRegistrationPrintFilter(registrationSurface, "unprinted");
+          await this.refreshSingleOrderRows(registrationSurface);
           const recovered = await this.recoverUnprintedRegistrationRows(
             registrationSurface,
             batch,
@@ -2192,6 +2192,9 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
   }
 
   private async connectionStatus(page: Page): Promise<FulfillmentConnectionResult> {
+    if (this.selectors.readyMarker) {
+      await waitForVisibleCandidates(page.locator(`${this.selectors.readyMarker}, [id="user.id"]`), LOGEN_MAIN_READY_TIMEOUT_MS);
+    }
     const url = page.url();
     if (isLoginUrl(url) || (await this.hasVisibleLoginForm(page))) {
       return {
@@ -2235,6 +2238,7 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
   private async clickLoginWhenCredentialsAreReady(
     page: Page,
   ): Promise<FulfillmentConnectionResult | undefined> {
+    await waitForVisibleCandidates(page.locator(`${this.selectors.readyMarker || "#menuInput"}, [id="user.pw"]`), 10_000);
     if (!(await this.hasVisibleLoginForm(page))) return undefined;
     await page.waitForTimeout(700);
     const userId = await requireUniqueVisible(
@@ -2517,6 +2521,39 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
     }));
   }
 
+  private async refreshSingleOrderRows(
+    page: Page | Frame,
+  ): Promise<LogenSingleOrderRow[]> {
+    const search = await requireUniqueVisible(
+      page.locator(
+        requiredConfig(
+          this.selectors.registrationSearchButton,
+          "로젠 조회(F2) 버튼 셀렉터",
+        ),
+      ),
+      "로젠 조회(F2) 버튼",
+    );
+    await search.click();
+    await page.waitForTimeout(1_000);
+    return await this.readSingleOrderRows(page);
+  }
+
+  private async ensureRegistrationSurface(): Promise<Page | Frame> {
+    try {
+      return await this.requireRememberedRegistrationSurface();
+    } catch {
+      const login = await this.openRegistration();
+      if (login.status !== "ready") {
+        throw new FulfillmentAdapterBlockedError(login.message);
+      }
+      const opened = await this.openSingleOrderRegistration();
+      if (opened.status !== "ready") {
+        throw new FulfillmentAdapterBlockedError(opened.message);
+      }
+      return await this.requireRememberedRegistrationSurface();
+    }
+  }
+
   private async waitForRegistrationSuccess(
     page: Page | Frame,
   ): Promise<Locator> {
@@ -2568,7 +2605,8 @@ export class LogenBrowserAdapter implements LogenPort, LogenBatchPort {
         (row) =>
           Boolean(row.registrationKey) &&
           !previousKeys.has(row.registrationKey) &&
-          cleanCellText(row.recipientName) === cleanCellText(recipientName),
+          cleanCellText(row.recipientName) === cleanCellText(recipientName) &&
+          row.printCount === 0,
       );
       if (added.length > 0) latest = added;
       const quantity = added.reduce(
@@ -3409,13 +3447,19 @@ async function visibleCount(locator: Locator): Promise<number> {
   return visible;
 }
 
-async function requireUniqueVisible(locator: Locator, label: string): Promise<Locator> {
-  const count = await locator.count();
-  const visible: Locator[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const candidate = locator.nth(index);
-    if (await candidate.isVisible()) visible.push(candidate);
+export async function closeSupplierDatePicker(page: Page): Promise<void> {
+  const popup = page.locator(".ant-picker-dropdown:visible");
+  await page.keyboard.press("Escape");
+  await popup.first().waitFor({ state: "hidden", timeout: 5_000 }).catch(() => undefined);
+  if ((await visibleCount(popup)) > 0) {
+    throw new FulfillmentAdapterBlockedError(
+      "날짜 선택창이 닫히지 않았습니다. 열린 쿠팡 화면에서 날짜를 확인한 뒤 다시 실행하세요.",
+    );
   }
+}
+
+async function requireUniqueVisible(locator: Locator, label: string): Promise<Locator> {
+  const visible = await waitForVisibleCandidates(locator);
   if (visible.length !== 1) {
     throw new FulfillmentAdapterBlockedError(
       `${label}을(를) 하나로 식별하지 못했습니다. 표시된 후보: ${visible.length}개`,
@@ -3424,50 +3468,72 @@ async function requireUniqueVisible(locator: Locator, label: string): Promise<Lo
   return visible[0];
 }
 
-async function locateFinalAgreementCheckbox(
+const SUPPLIER_FINAL_AGREEMENT_TIMEOUT_MS = 20_000;
+
+async function uniqueVisibleCandidate(
+  locator: Locator,
+  label: string,
+): Promise<Locator | undefined> {
+  const visible = await waitForVisibleCandidates(locator, 0);
+  if (visible.length > 1) {
+    throw new FulfillmentAdapterBlockedError(
+      `${label}을(를) 하나로 식별하지 못했습니다. 표시된 후보: ${visible.length}개`,
+    );
+  }
+  return visible[0];
+}
+
+export async function locateFinalAgreementCheckbox(
   page: Page,
   configuredSelector: string,
 ): Promise<Locator> {
   const headingCandidates = page.getByText(/8\.\s*최종\s*동의/);
-  await headingCandidates
-    .first()
-    .waitFor({ state: "visible", timeout: 5_000 })
-    .catch(() => undefined);
-
   const configured = page.locator(configuredSelector);
-  if ((await visibleCount(configured)) === 1) {
-    return requireUniqueVisible(configured, "Supplier Hub 8. 최종 동의 선택란");
-  }
+  const accessibleAgreement = page.getByRole("checkbox", {
+    name: /전체\s*선택.*안내문.*모두\s*동의/,
+  });
+  const agreementTextCheckbox = page
+    .getByText(/전체\s*선택.*안내문을\s*확인하고.*동의/)
+    .locator("xpath=ancestor::*[.//input[@type='checkbox']][1]//input[@type='checkbox']");
 
-  const visibleHeadings: Locator[] = [];
-  for (let index = 0; index < (await headingCandidates.count()); index += 1) {
-    const candidate = headingCandidates.nth(index);
-    if (await candidate.isVisible()) visibleHeadings.push(candidate);
-  }
-  for (const heading of visibleHeadings) {
-    const nearestAgreementCheckbox = heading.locator(
-      "xpath=ancestor::*[.//input[@type='checkbox']][1]//input[@type='checkbox']",
+  const deadline = Date.now() + SUPPLIER_FINAL_AGREEMENT_TIMEOUT_MS;
+  while (Date.now() <= deadline) {
+    const configuredMatch = await uniqueVisibleCandidate(
+      configured,
+      "Supplier Hub 8. 최종 동의 선택란",
     );
-    if ((await visibleCount(nearestAgreementCheckbox)) === 1) {
-      return requireUniqueVisible(
+    if (configuredMatch) return configuredMatch;
+
+    const accessibleMatch = await uniqueVisibleCandidate(
+      accessibleAgreement,
+      "Supplier Hub 8. 최종 동의 선택란",
+    );
+    if (accessibleMatch) return accessibleMatch;
+
+    for (let index = 0; index < (await headingCandidates.count()); index += 1) {
+      const heading = headingCandidates.nth(index);
+      if (!(await heading.isVisible())) continue;
+      const nearestAgreementCheckbox = heading.locator(
+        "xpath=ancestor::*[.//input[@type='checkbox']][1]//input[@type='checkbox']",
+      );
+      const headingMatch = await uniqueVisibleCandidate(
         nearestAgreementCheckbox,
         "Supplier Hub 8. 최종 동의 선택란",
       );
+      if (headingMatch) return headingMatch;
     }
-  }
 
-  const agreementTextCheckbox = page
-    .getByText(/안내문을\s*확인하고.*동의/)
-    .locator("xpath=ancestor::*[.//input[@type='checkbox']][1]//input[@type='checkbox']");
-  if ((await visibleCount(agreementTextCheckbox)) === 1) {
-    return requireUniqueVisible(
+    const textMatch = await uniqueVisibleCandidate(
       agreementTextCheckbox,
       "Supplier Hub 8. 최종 동의 선택란",
     );
+    if (textMatch) return textMatch;
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   throw new FulfillmentAdapterBlockedError(
-    "Supplier Hub 8. 최종 동의 영역에서 선택란을 찾지 못했습니다.",
+    "Supplier Hub 8. 최종 동의 영역이 20초 안에 준비되지 않았습니다. 업로드 창을 확인한 뒤 다시 실행하세요.",
   );
 }
 

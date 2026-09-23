@@ -5,10 +5,14 @@
   "type": "module",
   "description": "Local MCP Apps dashboard for managing Coupang Supplier Hub Private Label purchase-order printing.",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "dev": "tsx src/server.ts",
+    "build:ui": "node scripts/build-ui.mjs",
+    "build": "npm run build:ui && tsc -p tsconfig.json",
+    "dev": "npm run build:ui && tsx src/server.ts",
+    "probe:logen-api": "node scripts/probe-logen-open-api.mjs",
+    "inspect:fulfillment": "node scripts/inspect-fulfillment.mjs",
     "start:logen-windows-mcp": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/start-logen-windows-mcp.ps1",
     "start": "node dist/server.js",
+    "pretest": "npm run build:ui",
     "test": "vitest run tests",
     "check": "npm run build && npm test"
   },

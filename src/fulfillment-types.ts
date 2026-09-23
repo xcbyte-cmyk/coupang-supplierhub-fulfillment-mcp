@@ -224,6 +224,20 @@ export interface ProductMaster {
   updatedAt: string;
 }
 
+export interface ProductUnitsUpdate {
+  skuCode: string;
+  unitsPerCarton: number;
+  expectedUnitsPerCarton: number | null;
+  expectedUpdatedAt: string | null;
+}
+
+export interface RegistrationPreviewInput {
+  runId: string;
+  dataSource: FulfillmentDataSource;
+  logenMethod?: LogenIntegrationMethod;
+  draftUnits?: Array<{ skuCode: string; unitsPerCarton: number }>;
+}
+
 export interface CenterMaster {
   centerCode: string;
   centerName: string;
@@ -571,6 +585,9 @@ export interface SupplierHubShipmentPort {
   uploadTrackingWorkbook(
     input: SupplierHubShipmentUploadInput,
   ): Promise<ParcelUploadSubmission>;
+  inspectTrackingWorkbook?(
+    fileName: string,
+  ): Promise<ParcelUploadSubmission | undefined>;
   listShipmentSummaries(
     expectedInboundDate: string,
     orderNos?: string[],

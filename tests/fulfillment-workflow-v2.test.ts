@@ -27,6 +27,7 @@ import type {
   SupplierHubShipmentPort,
 } from "../src/fulfillment-types.js";
 import { FulfillmentWorkflow } from "../src/fulfillment-workflow.js";
+import { attachOrderEvidence } from "./helpers/order-evidence.js";
 import { DemoOrderConfirmationWorkbookAdapter } from "../src/order-confirmation-workbook-adapter.js";
 
 const NOW = new Date("2026-08-07T02:00:00.000Z"); // 2026-08-07 11:00 KST
@@ -495,6 +496,7 @@ describe("FulfillmentWorkflow v2", () => {
   it("keeps an in-flight Logen registration unknown and never auto-registers it again", async () => {
     const harness = makeHarness();
     harness.logen.throwAfterRegistration = true;
+    harness.logen.inspectionState = "unknown";
     const runId = createRunWithOrders(harness.store, [ORDERS[0]]);
 
     const first = await harness.workflow.registerLogenDeliveryOrder({
@@ -510,6 +512,21 @@ describe("FulfillmentWorkflow v2", () => {
     expect(second.status).toBe("unknown");
     expect(harness.logen.registerCalls).toHaveLength(1);
     expect(harness.store.getLogenBatches(runId)[0]).toMatchObject({ status: "unknown" });
+  });
+
+  it("recovers an in-flight Logen registration from unprinted reservation rows without resubmitting", async () => {
+    const harness = makeHarness();
+    harness.logen.throwAfterRegistration = true;
+    const runId = createRunWithOrders(harness.store, [ORDERS[0]]);
+
+    const first = await harness.workflow.registerLogenDeliveryOrder({ runId, dataSource: "order_file" });
+    const second = await harness.workflow.registerLogenDeliveryOrder({ runId, dataSource: "order_file" });
+
+    expect(first.status).toBe("failed");
+    expect(second.status).toBe("completed");
+    expect(harness.logen.registerCalls).toHaveLength(1);
+    expect(harness.logen.inspectionCalls).toHaveLength(1);
+    expect(harness.store.getLogenBatches(runId)[0]).toMatchObject({ status: "registered", registrationKeys: [expect.any(String), expect.any(String)] });
   });
 
   it("keeps an in-flight Logen waybill print unknown and never auto-prints it again", async () => {
@@ -1235,7 +1252,9 @@ function createRun(store: FulfillmentStore): string {
 function createRunWithOrders(store: FulfillmentStore, orders: FulfillmentOrder[]): string {
   const scan = store.saveScan(orders, 30, NOW.toISOString());
   store.compareAndRecordNewOrders(scan.id, NOW.toISOString());
-  return store.createRun(scan.id, undefined, NOW.toISOString()).id;
+  const runId = store.createRun(scan.id, undefined, NOW.toISOString()).id;
+  attachOrderEvidence(store, runId);
+  return runId;
 }
 
 function seedRouting(store: FulfillmentStore): void {

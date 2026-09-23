@@ -32,6 +32,7 @@ import type {
   SupplierHubFulfillmentPort,
 } from "../src/fulfillment-types.js";
 import { FulfillmentWorkflow } from "../src/fulfillment-workflow.js";
+import { writeOrderEvidenceWorkbook } from "./helpers/order-evidence.js";
 
 const NOW = new Date("2026-08-01T00:00:00.000Z");
 const SINDOH = "SINDOH N600";
@@ -263,8 +264,7 @@ class RecordingSupplierHub implements SupplierHubFulfillmentPort {
   ): Promise<DownloadedOrderFile[]> {
     return orders.map((item) => ({
       orderNo: item.orderNo,
-      fileName: `${item.orderNo}.xlsx`,
-      filePath: `test://${runId}/${item.orderNo}.xlsx`,
+      ...writeOrderEvidenceWorkbook(item),
       items: structuredClone(item.items),
     }));
   }

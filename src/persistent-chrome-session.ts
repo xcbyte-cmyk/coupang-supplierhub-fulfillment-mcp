@@ -4,6 +4,8 @@ import { mkdir } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { trackWorkspaceBrowser, arrangeBrowserPage } from "./workspace-window-layout.js";
+import { SingleFlight } from "./browser-readiness.js";
 import {
   chromium,
   type Browser,
@@ -20,6 +22,7 @@ const FOCUS_BROWSER_WINDOW_SCRIPT = fileURLToPath(
  * from the Supplier Hub and Logen adapters.
  */
 export class PersistentChromeSession {
+  private readonly pageInitialization = new SingleFlight<Page>();
   private context?: BrowserContext;
   private page?: Page;
   private cdpBrowser?: Browser;
@@ -30,23 +33,26 @@ export class PersistentChromeSession {
     private readonly headless: boolean,
     private readonly connectionMode: "playwright" | "cdp" = "playwright",
     private readonly chromeExecutablePath?: string,
+    private readonly splitWithDashboard = false,
   ) {}
 
   async open(url: string): Promise<Page> {
     const page = await this.getPage();
     if (!sameOriginAndPath(page.url(), url)) {
       await page.goto(url, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(500);
     }
     return page;
   }
 
   async bringToFront(page: Page): Promise<void> {
     await page.bringToFront();
+    if (!this.headless && this.splitWithDashboard && !this.cdpProcess?.pid) {
+      await arrangeBrowserPage(page).catch(() => undefined);
+    }
     if (process.platform !== "win32" || this.headless || !this.cdpProcess?.pid) {
       return;
     }
-    await focusWindowsProcessWindow(this.cdpProcess.pid);
+    await focusWindowsProcessWindow(this.cdpProcess.pid, this.splitWithDashboard);
   }
 
   async close(): Promise<void> {
@@ -65,6 +71,10 @@ export class PersistentChromeSession {
   }
 
   private async getPage(): Promise<Page> {
+    return this.pageInitialization.run(() => this.initializePage());
+  }
+
+  private async initializePage(): Promise<Page> {
     if (!this.context) {
       await mkdir(this.profileDir, { recursive: true });
       if (this.connectionMode === "cdp") {
@@ -74,7 +84,7 @@ export class PersistentChromeSession {
           channel: "chrome",
           headless: this.headless,
           acceptDownloads: true,
-          viewport: { width: 1440, height: 960 },
+          viewport: this.splitWithDashboard ? null : { width: 1440, height: 960 },
         });
       }
       const context = this.context;
@@ -111,6 +121,10 @@ export class PersistentChromeSession {
       stdio: "ignore",
       windowsHide: this.headless,
     });
+    if (!this.headless && this.splitWithDashboard && this.cdpProcess.pid) {
+      const untrack = trackWorkspaceBrowser(this.cdpProcess.pid);
+      this.cdpProcess.once("exit", untrack);
+    }
 
     let lastError: unknown;
     for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -154,7 +168,7 @@ export function sameOriginAndPath(currentUrl: string, targetUrl: string): boolea
   }
 }
 
-async function focusWindowsProcessWindow(processId: number): Promise<void> {
+async function focusWindowsProcessWindow(processId: number, splitWithDashboard = false): Promise<void> {
   if (!existsSync(FOCUS_BROWSER_WINDOW_SCRIPT)) return;
   await new Promise<void>((resolveFocus) => {
     const child = spawn(
@@ -168,13 +182,14 @@ async function focusWindowsProcessWindow(processId: number): Promise<void> {
         FOCUS_BROWSER_WINDOW_SCRIPT,
         "-ProcessId",
         String(processId),
+        ...(splitWithDashboard ? ["-SplitWithDashboard"] : []),
       ],
       { stdio: "ignore", windowsHide: true },
     );
     const timeout = setTimeout(() => {
       child.kill();
       resolveFocus();
-    }, 3_000);
+    }, 5_000);
     const finish = () => {
       clearTimeout(timeout);
       resolveFocus();

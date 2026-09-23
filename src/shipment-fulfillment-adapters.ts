@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { SingleFlight, rowSignature, waitForChangedRows, waitForTableIdle, waitForVisibleCandidates } from "./browser-readiness.js";
+import { arrangeBrowserPage } from "./workspace-window-layout.js";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import {
@@ -125,6 +127,7 @@ export interface ShipmentFulfillmentSelectors {
   shipmentId: string;
   shipmentCenter: string;
   shipmentOrderNo?: string;
+  shipmentExpectedInboundDate?: string;
   shipmentNextPageItem?: string;
   shipmentNextPageButton?: string;
 }
@@ -146,6 +149,7 @@ export interface ShipmentFulfillmentBrowserConfig {
 
 export interface ShipmentFulfillmentPort {
   uploadWorkbook(input: BulkShipmentUploadInput): Promise<BulkShipmentUploadResult>;
+  inspectUploadJob(fileName: string): Promise<ShipmentUploadJob | undefined>;
   listShipments(
     expectedInboundDate: string | Date,
     orderNos?: string[],
@@ -307,7 +311,7 @@ export class SupplierHubShipmentFulfillmentAdapter
         input.submit === false
           ? undefined
           : await this.readLatestSameFileJob(fileName, false);
-      const page = await this.session.open(this.config.uploadUrl);
+      const page = await this.openShipmentRoute(this.config.uploadUrl);
       await this.requireAuthenticatedPage(
         page,
         this.config.selectors.uploadReadyMarker,
@@ -427,6 +431,10 @@ export class SupplierHubShipmentFulfillmentAdapter
     }
   }
 
+  async inspectUploadJob(fileName: string): Promise<ShipmentUploadJob | undefined> {
+    return await this.readLatestSameFileJob(fileName, true);
+  }
+
   async downloadShipmentPdfs(
     input: ShipmentPdfDownloadInput,
   ): Promise<ShipmentPdfDownloadResult> {
@@ -440,7 +448,7 @@ export class SupplierHubShipmentFulfillmentAdapter
         throw new ShipmentAdapterBlockedError("PDF 저장 경로가 폴더가 아닙니다.");
       }
       await mkdir(resolve(input.outputDir), { recursive: true });
-      const page = await this.session.open(this.config.shipmentListUrl);
+      const page = await this.openShipmentRoute(this.config.shipmentListUrl);
       await this.requireAuthenticatedPage(
         page,
         this.config.selectors.shipmentReadyMarker,
@@ -524,7 +532,7 @@ export class SupplierHubShipmentFulfillmentAdapter
       expectedInboundDateInput,
       "입고예정일",
     );
-    const page = await this.session.open(this.config.shipmentListUrl);
+    const page = await this.openShipmentRoute(this.config.shipmentListUrl);
     await this.requireAuthenticatedPage(
       page,
       this.config.selectors.shipmentReadyMarker,
@@ -627,7 +635,9 @@ export class SupplierHubShipmentFulfillmentAdapter
     requirePage: boolean,
   ): Promise<ShipmentUploadJob | undefined> {
     try {
-      const page = await this.session.open(this.config.jobsUrl ?? this.config.uploadUrl);
+      const page = await this.openShipmentRoute(
+        this.config.jobsUrl ?? this.config.uploadUrl,
+      );
       await this.requireAuthenticatedPage(
         page,
         this.config.selectors.jobsReadyMarker,
@@ -660,6 +670,50 @@ export class SupplierHubShipmentFulfillmentAdapter
       );
     }
     return observed;
+  }
+
+  /**
+   * Supplier Hub initializes parcel-shipment routes from the shipment list.
+   * Opening a bulk route directly from a dashboard session can redirect back
+   * to the dashboard, so prime the list before every upload/jobs route.
+   */
+  private async openShipmentRoute(targetUrl: string): Promise<Page> {
+    const page = await this.session.open(this.config.shipmentListUrl);
+    if (
+      !isLoginUrl(page.url()) &&
+      (await visibleCount(
+        page.locator(this.config.selectors.shipmentReadyMarker),
+      )) === 0
+    ) {
+      const directShipmentLink = page.locator('a[href^="/ibs/asn/active"]');
+      if ((await visibleCount(directShipmentLink)) === 0) {
+        const logisticsMenu = page.locator(
+          'a[href="/logistics"], button:has-text("물류")',
+        );
+        const visibleMenus = await waitForVisibleCandidates(logisticsMenu, 5_000);
+        if (visibleMenus[0]) await visibleMenus[0].click();
+      }
+      await waitForVisibleCandidates(directShipmentLink, 10_000);
+      const shipmentLink = await requireUniqueVisible(
+        directShipmentLink,
+        "물류 메뉴의 쉽먼트 링크",
+      );
+      await shipmentLink.click();
+      await waitForVisibleCandidates(
+        page.locator(this.config.selectors.shipmentReadyMarker),
+        15_000,
+      );
+    }
+    await this.requireAuthenticatedPage(
+      page,
+      this.config.selectors.shipmentReadyMarker,
+      this.config.selectors.shipmentSearchButton,
+      "쉽먼트 목록",
+    );
+    if (!sameOriginAndPath(page.url(), targetUrl)) {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    }
+    return page;
   }
 
   private async readJobs(page: Page): Promise<ShipmentUploadJob[]> {
@@ -712,8 +766,30 @@ export class SupplierHubShipmentFulfillmentAdapter
       page.locator(selectors.shipmentSearchButton),
       "쉽먼트 검색 버튼",
     );
+    const rows = page.locator(selectors.shipmentRows);
+    const previous = await rowSignature(rows);
     await search.click();
-    await page.waitForTimeout(700);
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      await waitForTableIdle(page);
+      const current = await rowSignature(rows);
+      const dates = selectors.shipmentExpectedInboundDate
+        ? await rows.locator(selectors.shipmentExpectedInboundDate).allTextContents()
+        : [];
+      const normalizedDates = dates.map((value) => value.trim()).filter(Boolean);
+      const settledForDate =
+        normalizedDates.length > 0 &&
+        normalizedDates.every((value) => value === date);
+      if (settledForDate || (current !== previous && current !== "[]")) {
+        await page.waitForTimeout(250);
+        await waitForTableIdle(page);
+        return;
+      }
+      await page.waitForTimeout(100);
+    }
+    throw new ShipmentAdapterBlockedError(
+      `입고예정일 ${date} 검색 결과의 갱신을 확인하지 못했습니다.`,
+    );
   }
 
   private async collectShipmentReferences(
@@ -753,8 +829,10 @@ export class SupplierHubShipmentFulfillmentAdapter
       ) {
         break;
       }
+      const rows = page.locator(this.config.selectors.shipmentRows);
+      const previous = await rowSignature(rows);
       await nextButton.click();
-      await page.waitForTimeout(600);
+      await waitForChangedRows(page, rows, previous);
     }
     return [...collected.values()];
   }
@@ -854,12 +932,13 @@ export class SupplierHubShipmentFulfillmentAdapter
     fallbackMarker: string,
     label: string,
   ): Promise<void> {
+    const marker = readyMarker ?? fallbackMarker;
+    if (!isLoginUrl(page.url())) await waitForVisibleCandidates(page.locator(marker), 15_000);
     if (isLoginUrl(page.url())) {
       throw new ShipmentAdapterBlockedError(
         `Supplier Hub 로그인이 필요합니다. 열린 전용 Chrome에서 로그인한 뒤 ${label}을 다시 실행하세요.`,
       );
     }
-    const marker = readyMarker ?? fallbackMarker;
     const count = await visibleCount(page.locator(marker));
     if (count === 0) {
       const candidates = await page.locator("input, select, button").evaluateAll((elements) =>
@@ -890,6 +969,7 @@ export class ShipmentAdapterBlockedError extends Error {
 }
 
 class PersistentBrowserSession {
+  private readonly pageInitialization = new SingleFlight<Page>();
   private context?: BrowserContext;
   private page?: Page;
 
@@ -900,8 +980,16 @@ class PersistentBrowserSession {
 
   async open(url: string): Promise<Page> {
     const page = await this.getPage();
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(400);
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+    } catch (error) {
+      if (!String(error).includes("net::ERR_ABORTED")) throw error;
+      await page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => undefined);
+      if (!sameOriginAndPath(page.url(), url)) {
+        await page.goto(url, { waitUntil: "domcontentloaded" });
+      }
+    }
+    if (!this.headless) await arrangeBrowserPage(page).catch(() => undefined);
     return page;
   }
 
@@ -912,13 +1000,17 @@ class PersistentBrowserSession {
   }
 
   private async getPage(): Promise<Page> {
+    return this.pageInitialization.run(() => this.initializePage());
+  }
+
+  private async initializePage(): Promise<Page> {
     if (!this.context) {
       await mkdir(this.profileDir, { recursive: true });
       this.context = await chromium.launchPersistentContext(this.profileDir, {
         channel: "chrome",
         headless: this.headless,
         acceptDownloads: true,
-        viewport: { width: 1440, height: 960 },
+        viewport: null,
       });
       this.context.on("close", () => {
         this.context = undefined;
@@ -1055,12 +1147,7 @@ function normalizeFileName(value: string): string {
 }
 
 async function requireUniqueVisible(locator: Locator, label: string): Promise<Locator> {
-  const count = await locator.count();
-  const visible: Locator[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const candidate = locator.nth(index);
-    if (await candidate.isVisible()) visible.push(candidate);
-  }
+  const visible = await waitForVisibleCandidates(locator);
   if (visible.length !== 1) {
     throw new ShipmentAdapterBlockedError(
       `${label}을(를) 하나로 식별하지 못했습니다. 표시된 후보: ${visible.length}개`,
@@ -1181,6 +1268,16 @@ function clampInteger(value: number, min: number, max: number, label: string): n
 
 function isLoginUrl(url: string): boolean {
   return /(?:\/|^)(?:login|auth|sign-in|signin|sso)(?:\/|\?|#|$)/i.test(url);
+}
+
+function sameOriginAndPath(currentUrl: string, targetUrl: string): boolean {
+  try {
+    const current = new URL(currentUrl);
+    const target = new URL(targetUrl);
+    return current.origin === target.origin && current.pathname === target.pathname;
+  } catch {
+    return false;
+  }
 }
 
 function runPowerShell(script: string, timeoutMs: number): Promise<string> {

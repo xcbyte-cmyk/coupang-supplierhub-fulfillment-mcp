@@ -253,6 +253,62 @@ describe("Logen single-order website flow", () => {
     expect(rows.map((row) => row.rowId)).toEqual(["15", "16"]);
   });
 
+  it("ignores previously printed rows when identifying newly saved cartons", async () => {
+    const script = String.raw`
+      import { chromium } from "playwright-core";
+      import { LogenBrowserAdapter } from "./src/fulfillment-adapters.ts";
+      const browser = await chromium.launch({
+        executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+        headless: true,
+      });
+      try {
+        const page = await browser.newPage();
+        await page.goto("data:text/html,<html><body></body></html>");
+        await page.evaluate('globalThis.rows = [{ id: "old-1", takeDt: 1785682800000, seq: 3, fixcustCd: "99999999", rcvCustNm: "동탄1", ordQty: 1, prtCnt: 1 }, { id: "old-2", takeDt: 1785682800000, seq: 4, fixcustCd: "99999999", rcvCustNm: "동탄1", ordQty: 1, prtCnt: 1 }, { id: "new-1", takeDt: 1785682800000, seq: 7, fixcustCd: "99999999", rcvCustNm: "동탄1", ordQty: 1, prtCnt: 0 }, { id: "new-2", takeDt: 1785682800000, seq: 8, fixcustCd: "99999999", rcvCustNm: "동탄1", ordQty: 1, prtCnt: 0 }]; globalThis.lrm01f0050Sheet1 = { getDataRows() { return globalThis.rows; }, getRowValue(row) { return row; } }');
+        const adapter = new LogenBrowserAdapter({ profileDir: "data/test-logen-profile" });
+        console.log(JSON.stringify(await adapter.waitForNewRegistrationRows(page, [], "동탄1", 2)));
+      } finally {
+        await browser.close();
+      }
+    `;
+    const output = execFileSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", script],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+    const rows = JSON.parse(output) as Array<{ rowId: string }>;
+
+    expect(rows.map((row) => row.rowId)).toEqual(["new-1", "new-2"]);
+  });
+
+  it("runs 조회 before capturing the registration baseline", async () => {
+    const script = String.raw`
+      import { chromium } from "playwright-core";
+      import { LogenBrowserAdapter } from "./src/fulfillment-adapters.ts";
+      const browser = await chromium.launch({
+        executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe",
+        headless: true,
+      });
+      try {
+        const page = await browser.newPage();
+        await page.setContent('<button class="btn base search">조회</button>');
+        await page.evaluate('globalThis.queried = false; document.querySelector("button.search").addEventListener("click", function () { globalThis.queried = true; }); globalThis.lrm01f0050Sheet1 = { getDataRows() { return globalThis.queried ? [{ id: "existing", takeDt: 1785682800000, seq: 3, fixcustCd: "99999999", rcvCustNm: "동탄1", ordQty: 1, prtCnt: 1 }] : []; }, getRowValue(row) { return row; } }');
+        const adapter = new LogenBrowserAdapter({ profileDir: "data/test-logen-profile" });
+        console.log(JSON.stringify(await adapter.refreshSingleOrderRows(page)));
+      } finally {
+        await browser.close();
+      }
+    `;
+    const output = execFileSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", script],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+    const rows = JSON.parse(output) as Array<{ rowId: string }>;
+
+    expect(rows.map((row) => row.rowId)).toEqual(["existing"]);
+  });
+
   it("inspects both printed and unprinted filters before deciding the batch state", async () => {
     const script = String.raw`
       import { chromium } from "playwright-core";

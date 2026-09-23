@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
+import { automaticCartonReview, cartonEvidenceToken, inspectCartonOrderFiles, type ConfirmCartonOrderReviewInput, type OrderFileCache } from "./carton-order-review.js";
 import type { FulfillmentWorkflowMcpPort } from "./fulfillment-mcp.js";
 import { planFulfillment } from "./fulfillment-planning.js";
+import { canReplanLogenBatch, positiveCartonUnits, resolveCartonUnits, suggestCartonUnits } from "./fulfillment-registration-plan.js";
 import { FulfillmentStore } from "./fulfillment-store.js";
 import { resolveShipmentDispatchSchedule } from "./shipment-dispatch-schedule.js";
 import type {
@@ -25,6 +27,8 @@ import type {
   OrderConfirmationJob,
   OrderConfirmationWorkbookPort,
   ProductMaster,
+  ProductUnitsUpdate,
+  RegistrationPreviewInput,
   SenderProfile,
   ShipmentGroup,
   ShipmentWorkbookPort,
@@ -674,15 +678,214 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
     }, input.executionToken);
   }
 
+  async previewLogenRegistration(input: RegistrationPreviewInput) {
+    const allowDemo = (await this.config.modeReader?.() ?? "demo") !== "live";
+    const run = this.store.getRun(input.runId);
+    const drafts = new Map<string, number>();
+    for (const draft of input.draftUnits ?? []) {
+      if (drafts.has(draft.skuCode) || !positiveCartonUnits(draft.unitsPerCarton) ||
+          !run.orders.some(order => order.items.some(item => item.skuCode === draft.skuCode))) {
+        throw new Error("계산할 입수수량은 현재 실행의 SKU별 양의 정수로 한 번씩 지정하세요.");
+      }
+      drafts.set(draft.skuCode, draft.unitsPerCarton);
+    }
+    const masters = this.store.listProductMasters();
+    const masterBySku = new Map(masters.map(master => [master.skuCode, master]));
+    const orderFiles: OrderFileCache = new Map();
+    const rows = run.orders.flatMap(order => order.items.map(item => {
+      const master = masterBySku.get(item.skuCode);
+      const batch = run.logenBatches?.find(value => value.orderNo === order.orderNo && value.skuCode === item.skuCode);
+      const editable = canReplanLogenBatch(batch);
+      const fileEvidence = inspectCartonOrderFiles(run.artifacts, order.orderNo, item.skuCode, orderFiles);
+      const evidenceToken = cartonEvidenceToken({ runId: run.id, orderNo: order.orderNo, item, master, dataSource: input.dataSource, evidence: fileEvidence });
+      const savedReview = this.store.getCartonOrderReview(run.id, order.orderNo, item.skuCode);
+      const currentReview = savedReview?.evidenceToken === evidenceToken ? savedReview : undefined;
+      const resolved = resolveCartonUnits({ ...item, unitsPerCarton: fileEvidence.unitsPerCarton ?? undefined }, master,
+        input.dataSource === "auto" && fileEvidence.unitsPerCarton ? "order_file" : input.dataSource, allowDemo);
+      const draft = drafts.get(item.skuCode);
+      if (!editable && draft !== undefined && draft !== batch!.unitsPerCarton) {
+        throw new Error(`${item.skuCode}: 등록 이력이 있는 카톤 계획은 변경할 수 없습니다.`);
+      }
+      const units = editable ? draft ?? currentReview?.unitsPerCarton ?? resolved.units : batch!.unitsPerCarton;
+      const quantity = editable ? item.orderedQuantity : batch!.orderedQuantity;
+      const valid = Boolean(positiveCartonUnits(units) && positiveCartonUnits(quantity) && quantity % units! === 0);
+      const autoReview = automaticCartonReview({ evidence: fileEvidence, units, quantity,
+        masterUnits: master?.source === "demo" && !allowDemo ? undefined : positiveCartonUnits(master?.unitsPerCarton) });
+      const manualReview = Boolean(fileEvidence.available && currentReview && currentReview.method !== "automatic" && currentReview.unitsPerCarton === units && valid);
+      const cartonReviewMode = !editable ? "registered" : manualReview ? "manual" : autoReview.eligible ? "automatic" : "required";
+      const cartonReviewConfirmed = cartonReviewMode !== "required";
+      const center = this.resolveCenterForOrder(order, allowDemo, run.artifacts, false);
+      const issues: string[] = [];
+      if (editable && !fileEvidence.available) issues.push(`${order.orderNo}: 발주서 파일을 준비해야 포장 기준을 확인할 수 있습니다.`);
+      if (!cartonReviewConfirmed) issues.push(`${order.orderNo} / ${item.skuCode}: ${autoReview.reason} 예외 수량과 근거를 확인하세요.`);
+      if (!valid) issues.push(units ? `발주수량 ${quantity}개가 ${units}개입으로 나누어지지 않습니다.`
+        : `${order.orderNo} / ${item.skuCode}: 입수수량이 없습니다. 포장 기준을 입력·저장하세요.`);
+      if (!center || !isUsableCenter(center) || (!allowDemo && center.source === "demo")) issues.push(`${order.centerName}: 수취 정보를 확인하세요.`);
+      const registrationStatus = batch?.status ?? "not_started";
+      if (!editable && !["registered", "waybills_printed", "completed"].includes(registrationStatus)) {
+        issues.push("기존 등록 결과가 불명확합니다. 예약행을 확인하고 기존 등록 이력을 유지하세요.");
+      }
+      return {
+        orderNo: order.orderNo, skuCode: item.skuCode, skuName: item.skuName,
+        orderedQuantity: quantity, unitsPerCarton: units ?? null,
+        cartonCount: valid ? quantity / units! : 0,
+        source: !editable ? "registered" : draft !== undefined ? "draft" : cartonReviewMode === "automatic" ? "automatic" : currentReview ? "reviewed" : resolved.source,
+        masterUnitsPerCarton: master?.unitsPerCarton ?? null,
+        masterUpdatedAt: master?.updatedAt ?? null,
+        fileUnitsPerCarton: fileEvidence.unitsPerCarton,
+        fileEvidence, evidenceToken, cartonReviewConfirmed, cartonReviewMode, autoReview,
+        cartonReview: currentReview ?? null,
+        reviewNeedsReason: !fileEvidence.unitsPerCarton || fileEvidence.conflicting ||
+          (positiveCartonUnits(master?.unitsPerCarton) !== undefined && master!.unitsPerCarton !== fileEvidence.unitsPerCarton) ||
+          units !== fileEvidence.unitsPerCarton,
+        reviewChanged: Boolean(savedReview && !currentReview),
+        suggestion: editable && !resolved.units ? suggestCartonUnits(item, masters) ?? null : null,
+        editable, registrationStatus, pendingRegistration: editable,
+        centerName: order.centerName,
+        recipient: center ? { name: center.recipientName, address: center.address, telephone: center.telephone || center.mobile } : null,
+        issues,
+      };
+    }));
+    let sender = this.store.getSenderProfile();
+    if (!sender || !isUsableSender(sender) || (!allowDemo && isDemoSender(sender))) {
+      sender = undefined;
+      for (const artifact of run.artifacts.filter(value => value.type === "order_file" && value.status === "downloaded" && value.filePath?.toLowerCase().endsWith(".xlsx"))) {
+        try {
+          const fileSender = readShipmentWorkbookData(artifact.filePath!).sender;
+          const customerCode = fileSender?.customerCode || this.config.senderDefaults?.customerCode;
+          if (fileSender && customerCode) {
+            sender = { ...fileSender, customerCode, fareType: this.config.senderDefaults?.fareType ?? "030",
+              deliveryFare: this.config.senderDefaults?.deliveryFare ?? 0, updatedAt: this.isoNow() };
+            break;
+          }
+        } catch { /* A missing optional fallback is reported as an issue below. */ }
+      }
+    }
+    const issues = rows.flatMap(row => row.issues);
+    if (!rows.length) issues.push("선택한 발주의 상품 정보가 없습니다. 먼저 8단계 발주서를 준비하세요.");
+    if (run.workflowVersion < 3) issues.push("이전 버전 실행은 읽기 전용입니다.");
+    if (["released", "completed"].includes(run.status)) issues.push("종료된 실행은 새 등록을 할 수 없습니다.");
+    if (!sender || !isUsableSender(sender) || (!allowDemo && isDemoSender(sender))) issues.push("송하인 주소·연락처·로젠 거래처코드를 확인하세요.");
+    const method = input.logenMethod ?? run.logenIntegrationMethod ?? this.config.defaultLogenIntegrationMethod ?? "website_mcp";
+    if (run.logenIntegrationMethod && run.logenIntegrationMethod !== method) issues.push("이 실행에 저장된 로젠 연동방법과 선택값이 다릅니다.");
+    const readiness = await this.ports.logen.getReadiness?.("register", { integrationMethod: method });
+    if (readiness && !readiness.ready) issues.push(readiness.message);
+    const hasDraft = rows.some(row => row.source === "draft" && !row.cartonReviewConfirmed);
+    if (hasDraft) issues.push("계산에 사용한 입수수량이 아직 확인되지 않았습니다. 발주서 확인 기록을 저장하세요.");
+    const reviewToken = createHash("sha256").update(JSON.stringify({ runId: run.id, method,
+      dataSource: input.dataSource, rows, sender: sender ? { name: sender.name, address: sender.address,
+        telephone: sender.telephone, customerCode: sender.customerCode, fareType: sender.fareType, deliveryFare: sender.deliveryFare } : null,
+    })).digest("hex");
+    return {
+      status: "completed" as const, runId: run.id, readOnly: true, dataSource: input.dataSource, reviewToken,
+      logenMethod: method, rows, issues: [...new Set(issues)],
+      ready: issues.length === 0,
+      pendingBatchCount: rows.filter(row => row.pendingRegistration).length,
+      pendingCartonCount: rows.filter(row => row.pendingRegistration).reduce((sum, row) => sum + row.cartonCount, 0),
+      totalCartonCount: rows.reduce((sum, row) => sum + row.cartonCount, 0),
+      sender: sender ? { name: sender.name, address: sender.address, telephone: sender.telephone || sender.mobile,
+        customerCode: sender.customerCode, fareType: sender.fareType, deliveryFare: sender.deliveryFare } : null,
+        message: issues.length ? "자동 확인 중 예외 또는 등록 전 보완 항목을 발견했습니다." : "발주서 대조와 카톤 계산을 마쳤습니다. 등록 미리보기로 이어갈 수 있습니다.",
+    };
+  }
+
+  async saveProductCartonUnits(input: { runId: string; updates: ProductUnitsUpdate[]; confirmed: boolean }) {
+    if (this.mutationOwner || this.busy) throw new Error("업무 실행 중에는 포장 기준을 변경할 수 없습니다. 실행이 끝난 뒤 저장하세요.");
+    const owner = Symbol("save-product-carton-units");
+    this.mutationOwner = owner;
+    try {
+      if (input.confirmed !== true) throw new Error("입수수량을 포장 기준으로 확인한 뒤 저장하세요.");
+      if (!Array.isArray(input.updates) || !input.updates.length || input.updates.length > 100) throw new Error("저장할 SKU를 1~100개 지정하세요.");
+      const run = this.store.getRun(input.runId);
+      if (run.workflowVersion < 3 || ["released", "completed"].includes(run.status)) throw new Error("현재 처리 중인 v3 실행에서만 포장 기준을 저장할 수 있습니다.");
+      const seen = new Set<string>();
+      const masters: ProductMaster[] = input.updates.map(update => {
+        const items = run.orders.flatMap(order => order.items).filter(item => item.skuCode === update.skuCode);
+        const units = positiveCartonUnits(update.unitsPerCarton);
+        if (!items.length || seen.has(update.skuCode)) throw new Error("현재 실행의 SKU를 중복 없이 지정하세요.");
+        seen.add(update.skuCode);
+        if (!units || items.some(item => !positiveCartonUnits(item.orderedQuantity) || item.orderedQuantity % units !== 0)) throw new Error(`${update.skuCode}: 발주수량을 나머지 없이 나누는 양의 정수 입수수량을 입력하세요.`);
+        if (run.logenBatches?.some(batch => batch.skuCode === update.skuCode && !canReplanLogenBatch(batch))) throw new Error(`${update.skuCode}: 등록 또는 결과 불명확 이력이 있어 포장 기준 변경을 중단했습니다.`);
+        if (run.shippingJobs.some(job => job.skuCode === update.skuCode && (
+          !["ready", "blocked", "failed"].includes(job.status) || job.slipNo || job.shipmentId ||
+          job.logenRegisteredAt || job.waybillPrintedAt || job.trackingRegisteredAt || job.documentsPrintedAt
+        ))) throw new Error(`${update.skuCode}: 진행된 배송 이력이 있어 변경할 수 없습니다.`);
+        const current = this.store.getProductMaster(update.skuCode);
+        if ((current?.unitsPerCarton ?? null) !== update.expectedUnitsPerCarton || (current?.updatedAt ?? null) !== update.expectedUpdatedAt) throw new Error(`${update.skuCode}: 포장 기준이 다른 작업에서 변경됐습니다. 새로 확인한 뒤 저장하세요.`);
+        return { skuCode: update.skuCode, skuName: items[0].skuName, unitsPerCarton: units, source: "backend", updatedAt: this.isoNow() };
+      });
+      this.store.saveConfirmedProductUnits(run.id, masters);
+      const preview = await this.previewLogenRegistration({ runId: run.id, dataSource: "auto" });
+      return { ...preview, message: `${masters.length}개 SKU의 포장 기준을 저장했습니다. 기존 실행·등록 이력은 유지했습니다.`, savedSkuCodes: masters.map(master => master.skuCode) };
+    } finally {
+      if (this.mutationOwner === owner) this.mutationOwner = undefined;
+    }
+  }
+
+  async confirmCartonOrderReview(input: ConfirmCartonOrderReviewInput) {
+    if (this.mutationOwner || this.busy) throw new Error("업무 실행이 끝난 뒤 발주서 확인을 저장하세요.");
+    const owner = Symbol("confirm-carton-order-review");
+    this.mutationOwner = owner;
+    try {
+      if (input.confirmed !== true) throw new Error("발주서의 포장 기준을 확인한 뒤 저장하세요.");
+      const run = this.store.getRun(input.runId);
+      if (run.workflowVersion < 3 || ["released", "completed"].includes(run.status)) throw new Error("현재 처리 중인 실행에서만 확인할 수 있습니다.");
+      if (!input.reviews?.length || input.reviews.length > 100) throw new Error("확인할 발주 품목을 1~100개 지정하세요.");
+      const plan = await this.previewLogenRegistration({ runId: input.runId, dataSource: input.dataSource });
+      const seen = new Set<string>();
+      const reviews = input.reviews.map(review => {
+        const row = plan.rows.find(value => value.orderNo === review.orderNo && value.skuCode === review.skuCode);
+        const key = JSON.stringify([review.orderNo, review.skuCode]);
+        if (!row?.editable || seen.has(key)) throw new Error("현재 실행의 미등록 품목만 중복 없이 확인하세요.");
+        seen.add(key);
+        if (!row.fileEvidence.available) throw new Error(`${review.orderNo}: 발주서 파일을 먼저 준비하세요.`);
+        if (review.evidenceToken !== row.evidenceToken) throw new Error("발주서 또는 수량 기준이 변경됐습니다. 새로 불러온 뒤 다시 확인하세요.");
+        const units = positiveCartonUnits(review.unitsPerCarton);
+        if (!units || !positiveCartonUnits(row.orderedQuantity) || row.orderedQuantity % units !== 0) throw new Error(`${review.skuCode}: 발주수량을 나머지 없이 나누는 양의 정수를 입력하세요.`);
+        const note = typeof review.note === "string" ? review.note.trim() : "";
+        if ((row.reviewNeedsReason || units !== row.fileUnitsPerCarton) && note.length < 3) throw new Error(`${review.skuCode}: 누락·불일치 수량을 확인한 근거를 입력하세요.`);
+        if (note.length > 1000) throw new Error("확인 근거는 1000자 이내로 입력하세요.");
+        return { runId: run.id, orderNo: row.orderNo, skuCode: row.skuCode, evidenceToken: row.evidenceToken,
+          unitsPerCarton: units, note, confirmedAt: this.isoNow(), method: "manual" as const };
+      });
+      this.store.saveCartonOrderReviews(reviews);
+      return { ...await this.previewLogenRegistration({ runId: run.id, dataSource: input.dataSource }),
+        message: `${reviews.length}개 품목의 발주서 확인과 이번 적용 수량을 저장했습니다. 13단계 등록 미리보기로 이어가세요.` };
+    } finally {
+      if (this.mutationOwner === owner) this.mutationOwner = undefined;
+    }
+  }
+
   async registerLogenDeliveryOrder(input: {
     runId: string;
     dataSource: FulfillmentDataSource;
     logenMethod?: LogenIntegrationMethod;
     refreshMaster?: boolean;
+    reviewToken?: string;
     executionToken?: symbol;
   }): Promise<FulfillmentStageReply<ShippingJob>> {
     return this.runStage(input.runId, 13, async () => {
       const run = this.store.getRun(input.runId);
+      const reviewed = await this.previewLogenRegistration(input);
+      const pendingRows = reviewed.rows.filter(row => row.pendingRegistration);
+      // Rows still awaiting carton review are held back individually; confirmed rows keep going.
+      const reviewBlocked = new Map(pendingRows.filter(row => !row.cartonReviewConfirmed).map(row => [
+        JSON.stringify([row.orderNo, row.skuCode]),
+        `발주서 포장 기준 확인이 필요합니다. ${row.autoReview.reason}`,
+      ]));
+      if (!reviewed.rows.length || (pendingRows.length > 0 && reviewBlocked.size === pendingRows.length)) {
+        return { status: "blocked" as const, items: run.shippingJobs,
+          message: "발주서 포장 기준 확인이 필요합니다. 8단계 이후 검토에서 파일·적용 수량을 확인하고 저장하세요." };
+      }
+      if (input.reviewToken) {
+        if (!reviewed.ready || reviewed.reviewToken !== input.reviewToken) {
+          return { status: "blocked" as const, items: run.shippingJobs,
+            message: "등록 미리보기의 내용이 변경됐거나 보완이 필요합니다. 미리보기를 다시 확인하세요." };
+        }
+      }
+      this.store.saveCartonOrderReviews(reviewed.rows.filter(row => row.pendingRegistration && row.cartonReviewMode === "automatic")
+        .map(row => ({ runId: run.id, orderNo: row.orderNo, skuCode: row.skuCode, evidenceToken: row.evidenceToken,
+          unitsPerCarton: row.unitsPerCarton!, note: row.autoReview.reason, confirmedAt: this.isoNow(), method: "automatic" as const })));
       const logenMethod = this.store.bindLogenIntegrationMethod(
         run.id,
         input.logenMethod ??
@@ -698,27 +901,37 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
         input.dataSource,
         Boolean(input.refreshMaster),
         workflowMode !== "live",
+        new Map(reviewed.rows.map(row => [JSON.stringify([row.orderNo, row.skuCode]), row.unitsPerCarton!])),
+        reviewBlocked,
       );
-      this.store.saveShippingJobs(jobs);
+      for (const batch of this.store.getLogenBatches(run.id)) {
+        if (batch.status === "failed" && canReplanLogenBatch(batch)) {
+          this.store.resetLogenBatchBeforeSubmission(batch.id, "외부 주문 제출 전 실패 건의 계획을 다시 준비합니다.", this.isoNow());
+        }
+      }
+      this.store.replaceUnsubmittedShippingJobs(run.id, jobs);
 
+      const savedBatches = this.store.getLogenBatches(run.id);
       const resolvedOrders = run.orders.map((order) => ({
         ...order,
-        items: order.items.map((item) => ({
-          ...item,
-          unitsPerCarton:
-            jobs.find(
-              (job) => job.orderNo === order.orderNo && job.skuCode === item.skuCode,
-            )?.unitsPerCarton || undefined,
-        })),
+        items: order.items.map((item) => {
+          const existing = savedBatches.find(batch => batch.orderNo === order.orderNo && batch.skuCode === item.skuCode);
+          if (existing && !canReplanLogenBatch(existing)) return { ...item, orderedQuantity: existing.orderedQuantity, unitsPerCarton: existing.unitsPerCarton };
+          return { ...item, unitsPerCarton: jobs.find(job => job.orderNo === order.orderNo && job.skuCode === item.skuCode)?.unitsPerCarton || undefined };
+        }),
       }));
       const plan = planFulfillment({
         runId: run.id,
         orders: resolvedOrders,
         now: this.isoNow(),
       });
+      for (const batch of plan.batches) {
+        const message = reviewBlocked.get(JSON.stringify([batch.orderNo, batch.skuCode]));
+        if (message && batch.status === "blocked") batch.message = message;
+      }
       this.store.saveLogenBatches(plan.batches);
       for (const batch of this.store.getLogenBatches(run.id)) {
-        if (!isSafePreSubmissionLogenFailure(batch.status, batch.message)) continue;
+        if (!canReplanLogenBatch(batch) || !isSafePreSubmissionLogenFailure(batch.status, batch.message)) continue;
         this.store.resetLogenBatchBeforeSubmission(
           batch.id,
           "외부 주문 제출 전 실패 건을 사용자가 13단계에서 다시 실행했습니다.",
@@ -768,7 +981,7 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
       for (const batch of plan.batches) {
         if (batch.status !== "ready") continue;
         const order = run.orders.find((item) => item.orderNo === batch.orderNo)!;
-        const center = this.resolveCenterForOrder(order, workflowMode !== "live");
+        const center = this.resolveCenterForOrder(order, workflowMode !== "live", run.artifacts);
         const centerMessage = !center
           ? `센터 ${order.centerCode} 수취 정보가 저장되어 있지 않고 발주서에서도 확인되지 않았습니다.`
           : undefined;
@@ -789,6 +1002,68 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
           continue;
         }
         centersByOrder[order.orderNo] = center;
+      }
+
+      const unknownBatches = this.store.getLogenBatches(run.id).filter(
+        (batch) => batch.status === "unknown" && centersByOrder[batch.orderNo],
+      );
+      if (
+        logenMethod === "website_mcp" &&
+        unknownBatches.length > 0 &&
+        this.ports.logen.inspectBatchWaybills
+      ) {
+        const inspections = await this.ports.logen.inspectBatchWaybills(
+          unknownBatches,
+          {
+            integrationMethod: logenMethod,
+            recipientNamesByBatchId: Object.fromEntries(
+              unknownBatches.map((batch) => [
+                batch.id,
+                centersByOrder[batch.orderNo].centerName,
+              ]),
+            ),
+          },
+        );
+        for (const inspection of inspections) {
+          const batch = unknownBatches.find((item) => item.id === inspection.batchId);
+          if (!batch) continue;
+          const registrationKeys = [...new Set(inspection.registrationKeys)];
+          const safelyRecovered =
+            inspection.success &&
+            inspection.printState === "unprinted" &&
+            registrationKeys.length === batch.cartonCount;
+          if (!safelyRecovered) {
+            this.store.updateLogenBatch(batch.id, {
+              status: "unknown",
+              message: `기존 로젠 등록을 다시 제출하지 않고 확인했습니다. ${inspection.message}`,
+              updatedAt: this.isoNow(),
+            });
+            continue;
+          }
+          const recoveredAt = this.isoNow();
+          this.store.updateLogenBatch(batch.id, {
+            status: "registered",
+            logenOrderNo: registrationKeys[0],
+            registrationKeys,
+            registrationRecordedAt: recoveredAt,
+            waybillStatus: "not_started",
+            waybillMessage: undefined,
+            message: `외부 저장을 다시 실행하지 않고 미출력 예약행 ${registrationKeys.length}개를 복구했습니다.`,
+            updatedAt: recoveredAt,
+          });
+          for (const job of this.store
+            .getShippingJobs(run.id)
+            .filter(
+              (item) =>
+                item.orderNo === batch.orderNo && item.skuCode === batch.skuCode,
+            )) {
+            this.store.updateShippingJob(job.id, {
+              status: "registered",
+              error: undefined,
+              logenRegisteredAt: recoveredAt,
+            });
+          }
+        }
       }
 
       const pendingBatches = this.store.getLogenBatches(run.id).filter(
@@ -898,6 +1173,7 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
       }
 
       const finalBatches = this.store.getLogenBatches(run.id);
+      this.syncReviewedUnitsToMaster(run.id, pendingRows, finalBatches, input.dataSource, Boolean(input.refreshMaster));
       const finalJobs = this.store.getShippingJobs(run.id);
       const successCount = finalBatches.filter((batch) =>
         ["registered", "waybills_printed", "completed"].includes(batch.status),
@@ -2380,12 +2656,39 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
           (group) => group.expectedInboundDate,
         ),
       });
+      if (
+        uploadJob &&
+        ["unknown", "uploaded"].includes(uploadJob.status) &&
+        this.ports.shipmentHub?.inspectTrackingWorkbook
+      ) {
+        try {
+          const inspected = await this.ports.shipmentHub.inspectTrackingWorkbook(
+            uploadJob.fileName,
+          );
+          if (inspected?.status === "confirmed" || inspected?.status === "failed") {
+            uploadJob = this.store.updateCoupangUploadJob(uploadJob.id, {
+              status: inspected.status,
+              uploadNumber: inspected.uploadNumber,
+              message:
+                inspected.status === "confirmed"
+                  ? `재업로드 없이 쿠팡 처리내역을 대조했습니다. ${inspected.message}`
+                  : inspected.message,
+              updatedAt: this.isoNow(),
+            });
+          }
+        } catch {
+          // Keep the unknown state. A read failure must never trigger a resubmission.
+        }
+      }
       const unresolved =
         uploadJob && ["unknown", "failed", "uploaded"].includes(uploadJob.status)
           ? uploadJob
           : undefined;
+      const retrySafePreSubmissionFailure =
+        unresolved?.status === "failed" &&
+        isSafePreSubmissionShipmentFailure(unresolved.message);
 
-      if (unresolved && !forceRetry) {
+      if (unresolved && !forceRetry && !retrySafePreSubmissionFailure) {
         const isUnknown = unresolved.status === "unknown" || unresolved.status === "uploaded";
         for (const group of newUploadGroups) {
           this.store.updateShipmentGroup(group.id, {
@@ -2425,12 +2728,14 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
           };
           this.store.saveCoupangUploadJobs([uploadJob]);
           uploadJob = this.store.getCoupangUploadJob(uploadJob.id) ?? uploadJob;
-        } else if (unresolved && forceRetry) {
+        } else if (unresolved && (forceRetry || retrySafePreSubmissionFailure)) {
           uploadJob = this.store.updateCoupangUploadJob(uploadJob.id, {
             shipDate,
             shipTime,
             status: "prepared",
-            message: "사용자가 쉽먼트 일괄등록 재시도를 명시했습니다.",
+            message: retrySafePreSubmissionFailure
+              ? "외부 전송 전에 발생한 설정 차단을 해소하여 안전하게 다시 준비합니다."
+              : "사용자가 쉽먼트 일괄등록 재시도를 명시했습니다.",
             updatedAt: this.isoNow(),
           });
         } else if (
@@ -2688,7 +2993,14 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
         printed += 1;
         continue;
       }
-      if (["unknown", "failed"].includes(current.status) && !forceReprint) {
+      if (
+        ["unknown", "failed"].includes(current.status) &&
+        !forceReprint &&
+        !(
+          current.status === "failed" &&
+          isSafePrePrintShipmentDocumentFailure(current.message)
+        )
+      ) {
         if (current.status === "unknown") unknown += 1;
         else blocked += 1;
         continue;
@@ -2866,12 +3178,39 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
     };
   }
 
+  /**
+   * Once Logen accepts a reviewed PO·SKU, its confirmed pack size becomes the saved master.
+   * Backend mode keeps the backend value unless the operator asked to refresh it.
+   */
+  private syncReviewedUnitsToMaster(
+    runId: string,
+    rows: Array<{ orderNo: string; skuCode: string; skuName: string; unitsPerCarton: number | null; fileUnitsPerCarton: number | null; cartonReviewConfirmed: boolean }>,
+    batches: LogenBatch[],
+    dataSource: FulfillmentDataSource,
+    refreshMaster: boolean,
+  ): void {
+    if (dataSource === "backend" && !refreshMaster) return;
+    const updates = new Map<string, ProductMaster>();
+    for (const row of rows) {
+      const units = positiveCartonUnits(row.unitsPerCarton);
+      const batch = batches.find(value => value.orderNo === row.orderNo && value.skuCode === row.skuCode);
+      if (!units || !row.cartonReviewConfirmed || !batch || !["registered", "waybills_printed", "completed"].includes(batch.status)) continue;
+      const current = this.store.getProductMaster(row.skuCode);
+      const source = units === row.fileUnitsPerCarton ? "order_file" : "backend";
+      if (current?.unitsPerCarton === units && current.source !== "demo") continue;
+      updates.set(row.skuCode, { skuCode: row.skuCode, skuName: row.skuName, unitsPerCarton: units, source, updatedAt: this.isoNow() });
+    }
+    if (updates.size) this.store.saveConfirmedProductUnits(runId, [...updates.values()], "발주서 확인 후 로젠 등록 완료된 입수수량으로 갱신");
+  }
+
   private createCartonJobs(
     runId: string,
     orders: FulfillmentOrder[],
     dataSource: FulfillmentDataSource,
     refreshMaster: boolean,
     allowDemoMaster: boolean,
+    reviewedUnits?: Map<string, number>,
+    reviewBlocked?: Map<string, string>,
   ): ShippingJob[] {
     const jobs: ShippingJob[] = [];
     for (const order of orders) {
@@ -2881,13 +3220,29 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
           storedMaster?.source === "demo" && !allowDemoMaster
             ? undefined
             : storedMaster;
+        const key = JSON.stringify([order.orderNo, item.skuCode]);
+        const reviewMessage = reviewBlocked?.get(key);
+        if (reviewMessage) {
+          jobs.push({
+            id: deterministicJobId(runId, order.orderNo, item.skuCode, 0),
+            runId,
+            orderNo: order.orderNo,
+            skuCode: item.skuCode,
+            skuName: item.skuName,
+            cartonIndex: 0,
+            shippedQuantity: positiveInteger(item.orderedQuantity) ?? 0,
+            unitsPerCarton: 0,
+            fixTakeNo: fixTakeNo(order.orderNo, item.skuCode, 0),
+            status: "blocked",
+            error: reviewMessage,
+          });
+          continue;
+        }
         const fileUnits = positiveInteger(item.unitsPerCarton);
-        let unitsPerCarton: number | undefined;
-        if (dataSource === "backend") unitsPerCarton = positiveInteger(master?.unitsPerCarton);
-        if (dataSource === "order_file") unitsPerCarton = fileUnits;
-        if (dataSource === "auto") unitsPerCarton = positiveInteger(master?.unitsPerCarton) ?? fileUnits;
+        const confirmedUnits = reviewedUnits?.get(key);
+        let unitsPerCarton = confirmedUnits ?? resolveCartonUnits(item, master, dataSource, allowDemoMaster, refreshMaster).units;
 
-        if (fileUnits && (refreshMaster || !master || dataSource === "order_file")) {
+        if (confirmedUnits === undefined && fileUnits && (refreshMaster || !master || dataSource === "order_file")) {
           const updated: ProductMaster = {
             skuCode: item.skuCode,
             skuName: item.skuName,
@@ -2946,13 +3301,23 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
   private resolveCenterForOrder(
     order: FulfillmentOrder,
     allowDemoMaster: boolean,
+    artifacts: FulfillmentArtifact[] = [],
+    persist = true,
   ): CenterMaster | undefined {
     const stored = this.store.getCenterMaster(order.centerCode);
     if (stored && (allowDemoMaster || stored.source !== "demo") && isUsableCenter(stored)) {
       return stored;
     }
 
-    const fromOrderFile = this.store.getOrderFileCenter(order.orderNo);
+    let fromOrderFile = this.store.getOrderFileCenter(order.orderNo);
+    if (!fromOrderFile || !isUsableCenter(fromOrderFile)) {
+      for (const artifact of artifacts.filter(value => value.orderNo === order.orderNo && value.type === "order_file" && value.status === "downloaded" && value.filePath?.toLowerCase().endsWith(".xlsx"))) {
+        try {
+          const parsed = readShipmentWorkbookData(artifact.filePath!).orders.find(value => value.orderNo === order.orderNo)?.centerMaster;
+          if (parsed && isUsableCenter(parsed)) { fromOrderFile = parsed; break; }
+        } catch { /* The preview reports a missing recipient; it never repeats the download. */ }
+      }
+    }
     if (!fromOrderFile || !isUsableCenter(fromOrderFile)) return undefined;
     const promoted: CenterMaster = {
       ...fromOrderFile,
@@ -2961,7 +3326,10 @@ export class FulfillmentWorkflow implements FulfillmentWorkflowMcpPort {
       source: "order_file",
       updatedAt: this.isoNow(),
     };
-    this.store.upsertCenterMaster(promoted);
+    if (persist) {
+      this.store.saveOrderFileCenter(order.orderNo, promoted);
+      this.store.upsertCenterMaster(promoted);
+    }
     return promoted;
   }
 
@@ -3232,6 +3600,26 @@ function isSafePreSubmissionLogenFailure(
     "로젠 주문등록 URL",
     "셀렉터 설정이 필요합니다.",
   ].some((marker) => text.includes(marker));
+}
+
+/** Only failures known to occur before the workbook leaves this PC may retry automatically. */
+export function isSafePreSubmissionShipmentFailure(
+  message: string | undefined,
+): boolean {
+  const text = message ?? "";
+  return [
+    "실제 등록에 필요한 업로드 작업목록과 쉽먼트 매핑 셀렉터가 아직 교정되지 않았습니다.",
+    "[blocked] Supplier Hub 쉽먼트 실연동 설정이 완료되지 않아 작업을 차단했습니다.",
+  ].some((marker) => text.includes(marker));
+}
+
+/** A document lookup failure happens before any local print request is created. */
+export function isSafePrePrintShipmentDocumentFailure(
+  message: string | undefined,
+): boolean {
+  return (message ?? "").includes(
+    "입고예정일과 일치하는 쉽먼트를 찾지 못했습니다.",
+  );
 }
 
 function hasSavedUnreconciledLogenEvidence(

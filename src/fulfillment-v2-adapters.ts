@@ -31,6 +31,27 @@ export class LiveSupplierHubShipmentAdapter implements SupplierHubShipmentPort {
     return mapLiveUploadResult(result);
   }
 
+  async inspectTrackingWorkbook(
+    fileName: string,
+  ): Promise<ParcelUploadSubmission | undefined> {
+    const job = await this.delegate.inspectUploadJob(fileName);
+    if (!job) return undefined;
+    return {
+      status:
+        job.status === "completed"
+          ? "confirmed"
+          : job.status === "failed"
+            ? "failed"
+            : "unknown",
+      uploadNumber: job.jobId,
+      message:
+        job.message ||
+        (job.status === "completed"
+          ? "쿠팡 일괄등록 처리내역에서 완료 상태를 확인했습니다."
+          : `쿠팡 일괄등록 처리내역 상태: ${job.rawStatus}`),
+    };
+  }
+
   async listShipmentSummaries(
     expectedInboundDate: string,
     orderNos?: string[],
@@ -277,6 +298,13 @@ export class ModeRoutedSupplierHubShipmentAdapter
     input: SupplierHubShipmentUploadInput,
   ): Promise<ParcelUploadSubmission> {
     return (await this.target()).uploadTrackingWorkbook(input);
+  }
+
+  async inspectTrackingWorkbook(
+    fileName: string,
+  ): Promise<ParcelUploadSubmission | undefined> {
+    const target = await this.target();
+    return await target.inspectTrackingWorkbook?.(fileName);
   }
 
   async listShipmentSummaries(

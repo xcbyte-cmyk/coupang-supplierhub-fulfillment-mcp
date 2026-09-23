@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import type { CartonOrderReview } from "./carton-order-review.js";
 import { DatabaseSync } from "node:sqlite";
 import { migrateFulfillmentDatabase } from "./fulfillment-store-schema.js";
+import { canReplanLogenBatch } from "./fulfillment-registration-plan.js";
 import type {
   CenterMaster,
   ClassifiedFulfillmentOrder,
@@ -1046,15 +1048,60 @@ export class FulfillmentStore {
     const row = this.db.prepare("SELECT * FROM product_master WHERE sku_code = ?").get(skuCode) as
       | Record<string, unknown>
       | undefined;
-    return row
-      ? {
-          skuCode: String(row.sku_code),
-          skuName: String(row.sku_name),
-          unitsPerCarton: Number(row.units_per_carton),
-          source: row.source as ProductMaster["source"],
-          updatedAt: String(row.updated_at),
-        }
-      : undefined;
+    return row ? productMasterFromRow(row) : undefined;
+  }
+
+  listProductMasters(): ProductMaster[] {
+    return (this.db.prepare("SELECT * FROM product_master ORDER BY sku_code").all() as Array<Record<string, unknown>>)
+      .map(productMasterFromRow);
+  }
+
+  getCartonOrderReview(runId: string, orderNo: string, skuCode: string): CartonOrderReview | undefined {
+    const row = this.db.prepare("SELECT review_json FROM fulfillment_carton_order_reviews WHERE run_id = ? AND order_no = ? AND sku_code = ?")
+      .get(runId, orderNo, skuCode) as { review_json: string } | undefined;
+    return row ? JSON.parse(row.review_json) as CartonOrderReview : undefined;
+  }
+
+  saveCartonOrderReviews(reviews: CartonOrderReview[]): void {
+    this.transaction(() => {
+      const statement = this.db.prepare(`INSERT INTO fulfillment_carton_order_reviews (run_id, order_no, sku_code, review_json)
+        VALUES (?, ?, ?, ?) ON CONFLICT(run_id, order_no, sku_code) DO UPDATE SET review_json = excluded.review_json`);
+      for (const review of reviews) statement.run(review.runId, review.orderNo, review.skuCode, JSON.stringify(review));
+    });
+  }
+
+  saveConfirmedProductUnits(runId: string, masters: ProductMaster[], confirmation = "사용자가 SKU 포장 기준으로 확인하고 저장"): void {
+    this.transaction(() => {
+      const record = this.db.prepare(`INSERT INTO product_master_changes
+        (id, run_id, sku_code, previous_units, units_per_carton, confirmed_at, confirmation)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      for (const master of masters) {
+        const previous = this.getProductMaster(master.skuCode);
+        this.upsertProductMaster(master);
+        record.run(randomUUID(), runId, master.skuCode, previous?.unitsPerCarton ?? null,
+          master.unitsPerCarton, master.updatedAt, confirmation);
+      }
+    });
+  }
+
+  /** Only replace local plans that have never acquired external delivery evidence. */
+  replaceUnsubmittedShippingJobs(runId: string, jobs: ShippingJob[]): void {
+    this.transaction(() => {
+      const batches = this.getLogenBatches(runId);
+      const existing = this.getShippingJobs(runId);
+      const pairs = new Map(jobs.map(job => [`${job.orderNo}|${job.skuCode}`, job]));
+      const replaceable = new Set<string>();
+      for (const [key, pair] of pairs) {
+        if (!canReplanLogenBatch(batches.find(batch => batch.orderNo === pair.orderNo && batch.skuCode === pair.skuCode))) continue;
+        const previous = existing.filter(job => job.orderNo === pair.orderNo && job.skuCode === pair.skuCode);
+        if (previous.some(job => !["ready", "blocked", "failed"].includes(job.status) ||
+            job.slipNo || job.shipmentId || job.logenRegisteredAt || job.waybillPrintedAt || job.trackingRegisteredAt || job.documentsPrintedAt)) continue;
+        this.db.prepare("DELETE FROM fulfillment_shipping_jobs WHERE run_id = ? AND order_no = ? AND sku_code = ?")
+          .run(runId, pair.orderNo, pair.skuCode);
+        replaceable.add(key);
+      }
+      this.upsertShippingJobs(jobs.filter(job => replaceable.has(`${job.orderNo}|${job.skuCode}`)));
+    });
   }
 
   upsertCenterMaster(master: CenterMaster): void {
@@ -1215,59 +1262,61 @@ export class FulfillmentStore {
   }
 
   saveShippingJobs(jobs: ShippingJob[]): void {
-    this.transaction(() => {
-      const statement = this.db.prepare(
-        `INSERT INTO fulfillment_shipping_jobs
-         (id, run_id, order_no, sku_code, sku_name, carton_index, shipped_quantity,
-          units_per_carton, fix_take_no, status, error, slip_no, shipment_id,
-          logen_registered_at, waybill_printed_at, tracking_registered_at, documents_printed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(run_id, order_no, sku_code, carton_index) DO UPDATE SET
-          sku_name = excluded.sku_name, shipped_quantity = excluded.shipped_quantity,
-          units_per_carton = excluded.units_per_carton, fix_take_no = excluded.fix_take_no,
-          status = CASE
-            WHEN fulfillment_shipping_jobs.status IN
-              ('registered', 'waybill_printed', 'tracking_registered', 'documents_printed', 'unknown')
-              AND excluded.status IN ('ready', 'blocked')
-            THEN fulfillment_shipping_jobs.status
-            ELSE excluded.status
-          END,
-          error = CASE
-            WHEN fulfillment_shipping_jobs.status IN
-              ('registered', 'waybill_printed', 'tracking_registered', 'documents_printed', 'unknown')
-              AND excluded.status IN ('ready', 'blocked')
-            THEN fulfillment_shipping_jobs.error
-            ELSE excluded.error
-          END,
-          slip_no = COALESCE(excluded.slip_no, fulfillment_shipping_jobs.slip_no),
-          shipment_id = COALESCE(excluded.shipment_id, fulfillment_shipping_jobs.shipment_id),
-          logen_registered_at = COALESCE(excluded.logen_registered_at, fulfillment_shipping_jobs.logen_registered_at),
-          waybill_printed_at = COALESCE(excluded.waybill_printed_at, fulfillment_shipping_jobs.waybill_printed_at),
-          tracking_registered_at = COALESCE(excluded.tracking_registered_at, fulfillment_shipping_jobs.tracking_registered_at),
-          documents_printed_at = COALESCE(excluded.documents_printed_at, fulfillment_shipping_jobs.documents_printed_at)`,
+    this.transaction(() => this.upsertShippingJobs(jobs));
+  }
+
+  private upsertShippingJobs(jobs: ShippingJob[]): void {
+    const statement = this.db.prepare(
+      `INSERT INTO fulfillment_shipping_jobs
+       (id, run_id, order_no, sku_code, sku_name, carton_index, shipped_quantity,
+        units_per_carton, fix_take_no, status, error, slip_no, shipment_id,
+        logen_registered_at, waybill_printed_at, tracking_registered_at, documents_printed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id, order_no, sku_code, carton_index) DO UPDATE SET
+        sku_name = excluded.sku_name, shipped_quantity = excluded.shipped_quantity,
+        units_per_carton = excluded.units_per_carton, fix_take_no = excluded.fix_take_no,
+        status = CASE
+          WHEN fulfillment_shipping_jobs.status IN
+            ('registered', 'waybill_printed', 'tracking_registered', 'documents_printed', 'unknown')
+            AND excluded.status IN ('ready', 'blocked')
+          THEN fulfillment_shipping_jobs.status
+          ELSE excluded.status
+        END,
+        error = CASE
+          WHEN fulfillment_shipping_jobs.status IN
+            ('registered', 'waybill_printed', 'tracking_registered', 'documents_printed', 'unknown')
+            AND excluded.status IN ('ready', 'blocked')
+          THEN fulfillment_shipping_jobs.error
+          ELSE excluded.error
+        END,
+        slip_no = COALESCE(excluded.slip_no, fulfillment_shipping_jobs.slip_no),
+        shipment_id = COALESCE(excluded.shipment_id, fulfillment_shipping_jobs.shipment_id),
+        logen_registered_at = COALESCE(excluded.logen_registered_at, fulfillment_shipping_jobs.logen_registered_at),
+        waybill_printed_at = COALESCE(excluded.waybill_printed_at, fulfillment_shipping_jobs.waybill_printed_at),
+        tracking_registered_at = COALESCE(excluded.tracking_registered_at, fulfillment_shipping_jobs.tracking_registered_at),
+        documents_printed_at = COALESCE(excluded.documents_printed_at, fulfillment_shipping_jobs.documents_printed_at)`,
+    );
+    for (const job of jobs) {
+      statement.run(
+        job.id,
+        job.runId,
+        job.orderNo,
+        job.skuCode,
+        job.skuName,
+        job.cartonIndex,
+        job.shippedQuantity,
+        job.unitsPerCarton,
+        job.fixTakeNo,
+        job.status,
+        job.error ?? null,
+        job.slipNo ?? null,
+        job.shipmentId ?? null,
+        job.logenRegisteredAt ?? null,
+        job.waybillPrintedAt ?? null,
+        job.trackingRegisteredAt ?? null,
+        job.documentsPrintedAt ?? null,
       );
-      for (const job of jobs) {
-        statement.run(
-          job.id,
-          job.runId,
-          job.orderNo,
-          job.skuCode,
-          job.skuName,
-          job.cartonIndex,
-          job.shippedQuantity,
-          job.unitsPerCarton,
-          job.fixTakeNo,
-          job.status,
-          job.error ?? null,
-          job.slipNo ?? null,
-          job.shipmentId ?? null,
-          job.logenRegisteredAt ?? null,
-          job.waybillPrintedAt ?? null,
-          job.trackingRegisteredAt ?? null,
-          job.documentsPrintedAt ?? null,
-        );
-      }
-    });
+    }
   }
 
   getShippingJobs(runId: string): ShippingJob[] {
@@ -1844,6 +1893,16 @@ function stageStatusToRunStatus(
   if (status === "partial") return "partial";
   if (status === "blocked") return "blocked";
   return "failed";
+}
+
+function productMasterFromRow(row: Record<string, unknown>): ProductMaster {
+  return {
+    skuCode: String(row.sku_code),
+    skuName: String(row.sku_name),
+    unitsPerCarton: Number(row.units_per_carton),
+    source: row.source as ProductMaster["source"],
+    updatedAt: String(row.updated_at),
+  };
 }
 
 function parseJson<T>(value: string): T {

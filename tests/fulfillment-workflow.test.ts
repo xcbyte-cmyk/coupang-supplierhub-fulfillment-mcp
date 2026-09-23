@@ -1,4 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
+import AdmZip from "adm-zip";
+import { mkdtempSync, unlinkSync, rmdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { readShipmentWorkbookData } from "../src/xlsx-order-reader.js";
 import { FulfillmentStore } from "../src/fulfillment-store.js";
 import type {
   CenterMaster,
@@ -22,6 +27,7 @@ import type {
   SupplierHubFulfillmentPort,
 } from "../src/fulfillment-types.js";
 import { FulfillmentWorkflow } from "../src/fulfillment-workflow.js";
+import { attachOrderEvidence, writeOrderEvidenceWorkbook } from "./helpers/order-evidence.js";
 import { DemoOrderConfirmationWorkbookAdapter } from "../src/order-confirmation-workbook-adapter.js";
 
 const NOW = new Date("2026-07-30T06:00:00.000Z");
@@ -93,8 +99,7 @@ class FakeSupplierHub implements SupplierHubFulfillmentPort {
       this.downloadLimit === undefined ? orders : orders.slice(0, this.downloadLimit);
     return selected.map((order) => ({
       orderNo: order.orderNo,
-      fileName: `${order.orderNo}.xlsx`,
-      filePath: `test://${runId}/${order.orderNo}.xlsx`,
+      ...writeOrderEvidenceWorkbook(order),
       items: structuredClone(order.items),
     }));
   }
@@ -142,6 +147,7 @@ class FakeLogen implements LogenPort, LogenBatchPort {
   waybillCalls: Array<{ batches: LogenBatch[]; printerName: string }> = [];
   legacyWaybillCalls = 0;
   throwLegacyWaybillAfterSubmit = false;
+  failOrderNos = new Set<string>();
 
   async openRegistration() {
     return { status: "ready" as const, message: "login ready" };
@@ -157,14 +163,16 @@ class FakeLogen implements LogenPort, LogenBatchPort {
     _centersByOrder: Record<string, CenterMaster>,
   ): Promise<LogenBatchRegistrationResult[]> {
     this.registerCalls.push(structuredClone(batches));
-    return batches.map((batch) => ({
-      batchId: batch.id,
-      fixTakeNo: batch.fixTakeNo,
-      success: true,
-      status: "registered",
-      logenOrderNo: batch.fixTakeNo,
-      message: "registered",
-    }));
+    return batches.map((batch) => this.failOrderNos.has(batch.orderNo)
+      ? { batchId: batch.id, fixTakeNo: batch.fixTakeNo, success: false, status: "failed" as const, message: "rejected" }
+      : {
+          batchId: batch.id,
+          fixTakeNo: batch.fixTakeNo,
+          success: true,
+          status: "registered" as const,
+          logenOrderNo: batch.fixTakeNo,
+          message: "registered",
+        });
   }
 
   async printBatchWaybills(
@@ -357,7 +365,153 @@ async function createRun(harness: Harness): Promise<string> {
   return selected.runId!;
 }
 
+async function createRunWithEvidence(harness: Harness): Promise<string> {
+  const runId = await createRun(harness);
+  attachOrderEvidence(harness.store, runId);
+  return runId;
+}
+
+/** Records the operator's manual carton review for every row that still needs one. */
+async function confirmCartonReviews(
+  harness: Harness,
+  runId: string,
+  dataSource: "auto" | "backend" | "order_file",
+  unitsPerCarton: number,
+) {
+  const plan = await harness.workflow.previewLogenRegistration({ runId, dataSource });
+  return harness.workflow.confirmCartonOrderReview({
+    runId,
+    dataSource,
+    confirmed: true,
+    reviews: plan.rows.filter((row) => row.editable && !row.cartonReviewConfirmed).map((row) => ({
+      orderNo: row.orderNo,
+      skuCode: row.skuCode,
+      evidenceToken: row.evidenceToken,
+      unitsPerCarton,
+      note: "실물 박스 라벨에서 입수수량 확인",
+    })),
+  });
+}
+
 describe("FulfillmentWorkflow", () => {
+  const missingItem = { skuCode: "70924435", skuName: "코멧 홈 BPA FREE TPU 걸이형 양면 도마_L_차콜", orderedQuantity: 200, source: "order_file" as const };
+  const unitsUpdate = { skuCode: "70924435", unitsPerCarton: 50, expectedUnitsPerCarton: null, expectedUpdatedAt: null };
+
+  it("recovers recipient data from a downloaded workbook using the current print-layout labels", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "supplierhub-order-fixture-"));
+    const filePath = join(directory, "order.xlsx");
+    const rows = [
+      ["거래처명", "검증 공급사"], ["전화번호", "031-123-4567"], ["회송주소", "경기도 테스트로 1"],
+      ["발주번호", "PO-FILE-RECOVERY"],
+      ["입고예정일시", "물류센터", "주소", "택배담당자"],
+      ["2026/09/15", "테스트 센터", "경상북도 테스트로 2(택배수령담당자 :+827000000001)", "+827000000001"],
+      ["No", "상품코드", "상품명", "발주수량"], ["1", "70924435", missingItem.skuName, "200"],
+    ];
+    const zip = new AdmZip();
+    zip.addFile("xl/worksheets/sheet1.xml", Buffer.from(`<worksheet><sheetData>${rows.map((row, i) => `<row r="${i + 1}">${row.map((value, j) => `<c r="${String.fromCharCode(65 + j)}${i + 1}" t="inlineStr"><is><t>${value}</t></is></c>`).join("")}</row>`).join("")}</sheetData></worksheet>`));
+    zip.writeZip(filePath);
+    try {
+      const parsed = readShipmentWorkbookData(filePath);
+      expect(parsed.sender?.address).toBe("경기도 테스트로 1");
+      expect(parsed.orders[0].centerMaster).toMatchObject({ address: "경상북도 테스트로 2", telephone: "+827000000001" });
+      expect(parsed.orders[0].items[0].unitsPerCarton).toBeUndefined();
+      const h = makeHarness([makeOrder("PO-FILE-RECOVERY", [missingItem])]);
+      const runId = await createRun(h);
+      h.store.recordArtifact({ runId, type: "order_file", status: "downloaded", orderNo: "PO-FILE-RECOVERY", filePath, fileName: "order.xlsx" });
+      h.store.setSenderProfile({ name: "검증 공급사", address: "경기도 테스트로 1", telephone: "031-123-4567", customerCode: "12345678", fareType: "신용", deliveryFare: 0, updatedAt: NOW.toISOString() });
+      await h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [unitsUpdate] });
+      const reviewed = await confirmCartonReviews(h, runId, "auto", 50);
+      expect(reviewed).toMatchObject({ ready: true, pendingCartonCount: 4 });
+      expect(h.store.getCenterMaster("FC-01")).toBeUndefined();
+      expect(h.store.getOrderFileCenter("PO-FILE-RECOVERY")).toBeUndefined();
+      expect((await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto", reviewToken: reviewed.reviewToken })).status).toBe("completed");
+      expect(h.store.getCenterMaster("FC-01")?.telephone).toBe("+827000000001");
+      expect(h.supplierHub.downloadCalls).toHaveLength(0);
+    } finally {
+      unlinkSync(filePath);
+      rmdirSync(directory);
+    }
+  });
+
+  it("previews missing units and a 50-unit suggestion without saving or registering", async () => {
+    const h = makeHarness([makeOrder("PO-PREVIEW", [missingItem])]);
+    seedRouting(h.store);
+    h.store.upsertProductMaster({ skuCode: "44133530", skuName: "코멧 홈 칼집이 잘 나지 않는 TPU 걸이형 양면 도마_차콜", unitsPerCarton: 50, source: "backend", updatedAt: NOW.toISOString() });
+    const runId = await createRunWithEvidence(h);
+    const before = h.store.getRun(runId);
+    const preview = await h.workflow.previewLogenRegistration({ runId, dataSource: "auto" });
+    expect(preview.ready).toBe(false);
+    expect(preview.rows[0]).toMatchObject({ unitsPerCarton: null, source: "missing", suggestion: { unitsPerCarton: 50, referenceSkuCode: "44133530" } });
+    const draft = await h.workflow.previewLogenRegistration({ runId, dataSource: "auto", draftUnits: [{ skuCode: missingItem.skuCode, unitsPerCarton: 50 }] });
+    expect(draft).toMatchObject({ ready: false, pendingCartonCount: 4 });
+    expect(draft.issues.join(" ")).toContain("아직 확인되지 않았습니다");
+    expect(h.store.getProductMaster(missingItem.skuCode)).toBeUndefined();
+    expect(h.store.getRun(runId)).toEqual(before);
+    expect(h.logen.registerCalls).toHaveLength(0);
+  });
+
+  it("saves confirmed units and resumes the same blocked run with four cartons exactly once", async () => {
+    const h = makeHarness([makeOrder("PO-RESUME", [missingItem])]);
+    seedRouting(h.store);
+    const runId = await createRun(h);
+    await h.workflow.downloadOrderFiles({ runId });
+    await h.workflow.printOrderFiles({ runId });
+    const previousStages = h.store.getRun(runId).stages;
+    expect((await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto" })).status).toBe("blocked");
+    expect(h.store.getRun(runId).shippingJobs.filter(job => job.cartonIndex > 0)).toEqual([]);
+    await h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [unitsUpdate] });
+    const saved = await confirmCartonReviews(h, runId, "auto", 50);
+    expect(saved).toMatchObject({ runId, ready: true, pendingCartonCount: 4 });
+    const registered = await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto", reviewToken: saved.reviewToken });
+    expect(registered.status).toBe("completed");
+    expect(registered.items.map(job => job.cartonIndex)).toEqual([1, 2, 3, 4]);
+    expect(h.store.getRun(runId).stages.filter(stage => stage.stage !== 13)).toEqual(previousStages);
+    expect(h.supplierHub.downloadCalls).toHaveLength(1);
+    expect(h.printer.calls).toHaveLength(1);
+    await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto" });
+    expect(h.logen.registerCalls).toHaveLength(1);
+    expect(h.logen.registerCalls[0][0].cartonCount).toBe(4);
+    expect((await h.workflow.previewLogenRegistration({ runId, dataSource: "auto" })).rows[0]).toMatchObject({ editable: false, source: "registered", cartonCount: 4 });
+    await expect(h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [{ ...unitsUpdate, unitsPerCarton: 25, expectedUnitsPerCarton: 50, expectedUpdatedAt: NOW.toISOString() }] })).rejects.toThrow("등록 또는 결과 불명확");
+  });
+
+  it("rejects unconfirmed, indivisible and stale changes without partially saving", async () => {
+    const h = makeHarness([makeOrder("PO-VALIDATE", [missingItem, { ...missingItem, skuCode: "OTHER" }])]);
+    seedRouting(h.store);
+    const runId = await createRun(h);
+    await expect(h.workflow.saveProductCartonUnits({ runId, confirmed: false, updates: [unitsUpdate] })).rejects.toThrow("확인");
+    await expect(h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [unitsUpdate, { ...unitsUpdate, skuCode: "OTHER", unitsPerCarton: 30 }] })).rejects.toThrow("나머지 없이");
+    expect(h.store.getProductMaster(missingItem.skuCode)).toBeUndefined();
+    await h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [unitsUpdate] });
+    await expect(h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [unitsUpdate] })).rejects.toThrow("다른 작업에서 변경");
+    expect(h.store.getProductMaster(missingItem.skuCode)?.unitsPerCarton).toBe(50);
+  });
+
+  it("blocks a stale registration preview and preserves unknown external registration evidence", async () => {
+    const h = makeHarness([makeOrder("PO-STALE", [missingItem])]);
+    seedRouting(h.store);
+    const runId = await createRunWithEvidence(h);
+    const preview = await h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [unitsUpdate] });
+    await h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [{ ...unitsUpdate, unitsPerCarton: 25, expectedUnitsPerCarton: 50, expectedUpdatedAt: NOW.toISOString() }] });
+    expect((await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto", reviewToken: preview.reviewToken })).status).toBe("blocked");
+    expect(h.logen.registerCalls).toHaveLength(0);
+    await confirmCartonReviews(h, runId, "auto", 25);
+    await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto" });
+    const batch = h.store.getLogenBatches(runId)[0];
+    h.store.updateLogenBatch(batch.id, { status: "unknown", message: "등록 결과 불명확" });
+    const before = h.store.getLogenBatches(runId);
+    await expect(h.workflow.saveProductCartonUnits({ runId, confirmed: true, updates: [{ ...unitsUpdate, expectedUnitsPerCarton: 25, expectedUpdatedAt: NOW.toISOString() }] })).rejects.toThrow("결과 불명확");
+    expect((await h.workflow.previewLogenRegistration({ runId, dataSource: "auto" })).ready).toBe(false);
+    await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto" });
+    expect(h.store.getLogenBatches(runId)).toEqual(before);
+    expect(h.logen.registerCalls).toHaveLength(1);
+    h.store.updateLogenBatch(batch.id, { status: "failed", message: "주문등록 제출 전 중단: 이전 오류 문구와 등록키가 함께 남은 건" });
+    const withRegistrationKey = h.store.getLogenBatches(runId);
+    await h.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto" });
+    expect(h.store.getLogenBatches(runId)).toEqual(withRegistrationKey);
+    expect(h.logen.registerCalls).toHaveLength(1);
+  });
+
   it("classifies confirmation-required orders and prepares the workbook before upload", async () => {
     const order = { ...makeOrder("PO-CONFIRM"), status: "거래처확인요청" };
     const harness = makeHarness([order]);
@@ -474,7 +628,8 @@ describe("FulfillmentWorkflow", () => {
       source: "backend",
       updatedAt: NOW.toISOString(),
     });
-    const backendRunId = await createRun(backendHarness);
+    const backendRunId = await createRunWithEvidence(backendHarness);
+    await confirmCartonReviews(backendHarness, backendRunId, "backend", 50);
     const backend = await backendHarness.workflow.registerLogenDeliveryOrder({
       runId: backendRunId,
       dataSource: "backend",
@@ -493,7 +648,8 @@ describe("FulfillmentWorkflow", () => {
       source: "backend",
       updatedAt: NOW.toISOString(),
     });
-    const fileRunId = await createRun(fileHarness);
+    const fileRunId = await createRunWithEvidence(fileHarness);
+    await confirmCartonReviews(fileHarness, fileRunId, "order_file", 25);
     const orderFile = await fileHarness.workflow.registerLogenDeliveryOrder({
       runId: fileRunId,
       dataSource: "order_file",
@@ -501,6 +657,7 @@ describe("FulfillmentWorkflow", () => {
 
     expect(orderFile.items).toHaveLength(4);
     expect(orderFile.items.every((job) => job.unitsPerCarton === 25)).toBe(true);
+    // The reviewed, successfully registered pack size becomes the saved master.
     expect(fileHarness.store.getProductMaster("SKU-1")).toMatchObject({
       unitsPerCarton: 25,
       source: "order_file",
@@ -510,7 +667,7 @@ describe("FulfillmentWorkflow", () => {
   it("expands quantity 100 with 50 units per carton into exactly two carton jobs", async () => {
     const harness = makeHarness([makeOrder("PO-CARTONS")]);
     seedRouting(harness.store);
-    const runId = await createRun(harness);
+    const runId = await createRunWithEvidence(harness);
 
     const result = await harness.workflow.registerLogenDeliveryOrder({
       runId,
@@ -544,7 +701,7 @@ describe("FulfillmentWorkflow", () => {
       ]),
     ]);
     seedRouting(harness.store);
-    const runId = await createRun(harness);
+    const runId = await createRunWithEvidence(harness);
 
     const result = await harness.workflow.registerLogenDeliveryOrder({
       runId,
@@ -562,10 +719,51 @@ describe("FulfillmentWorkflow", () => {
     ]);
   });
 
+  it("holds back only the SKU whose order file lacks a pack size and registers the verified SKU", async () => {
+    const harness = makeHarness([
+      makeOrder("PO-REVIEW-SPLIT", [
+        { skuCode: "SKU-UNSTATED", skuName: "입수수량 미기재 상품", orderedQuantity: 100, source: "order_file" },
+        { skuCode: "SKU-STATED", skuName: "입수수량 기재 상품", orderedQuantity: 20, unitsPerCarton: 10, source: "order_file" },
+      ]),
+    ]);
+    seedRouting(harness.store);
+    harness.store.upsertProductMaster({ skuCode: "SKU-UNSTATED", skuName: "입수수량 미기재 상품", unitsPerCarton: 50, source: "backend", updatedAt: NOW.toISOString() });
+    const runId = await createRunWithEvidence(harness);
+
+    const result = await harness.workflow.registerLogenDeliveryOrder({ runId, dataSource: "auto" });
+
+    expect(result.status).toBe("partial");
+    expect(harness.logen.registerCalls.flat().map((batch) => batch.skuCode)).toEqual(["SKU-STATED"]);
+    expect(result.items.find((job) => job.skuCode === "SKU-UNSTATED")).toMatchObject({
+      cartonIndex: 0,
+      status: "blocked",
+      error: expect.stringContaining("발주서 포장 기준 확인이 필요합니다"),
+    });
+    expect(harness.store.getLogenBatches(runId).find((batch) => batch.skuCode === "SKU-UNSTATED")).toMatchObject({
+      status: "blocked",
+      message: expect.stringContaining("발주서 포장 기준 확인이 필요합니다"),
+    });
+  });
+
+  it("keeps the saved master unchanged when the reviewed registration does not succeed", async () => {
+    const harness = makeHarness([makeOrder("PO-MASTER-FAIL", [
+      { skuCode: "SKU-1", skuName: "우선순위 상품", orderedQuantity: 100, unitsPerCarton: 25, source: "order_file" },
+    ])]);
+    seedRouting(harness.store);
+    harness.store.upsertProductMaster({ skuCode: "SKU-1", skuName: "우선순위 상품", unitsPerCarton: 50, source: "backend", updatedAt: NOW.toISOString() });
+    harness.logen.failOrderNos.add("PO-MASTER-FAIL");
+    const runId = await createRunWithEvidence(harness);
+    await confirmCartonReviews(harness, runId, "order_file", 25);
+
+    await harness.workflow.registerLogenDeliveryOrder({ runId, dataSource: "order_file" });
+
+    expect(harness.store.getProductMaster("SKU-1")).toMatchObject({ unitsPerCarton: 50, source: "backend" });
+  });
+
   it("does not register the same Logen carton orders again on a retry", async () => {
     const harness = makeHarness([makeOrder("PO-RETRY")]);
     seedRouting(harness.store);
-    const runId = await createRun(harness);
+    const runId = await createRunWithEvidence(harness);
 
     const first = await harness.workflow.registerLogenDeliveryOrder({
       runId,
